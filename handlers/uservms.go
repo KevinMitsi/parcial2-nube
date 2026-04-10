@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
+	"vbox-platform/logger"
 	"vbox-platform/vboxmanage"
 )
 
@@ -19,6 +21,7 @@ type UserVM struct {
 	Description string `json:"description"`
 	SourceVM    string `json:"sourceVM"`
 	DiskPath    string `json:"diskPath"`
+	DiskUUID    string `json:"diskUUID"`
 	Username    string `json:"username"`
 	HasUserKeys bool   `json:"hasUserKeys"`
 	IP          string `json:"ip"`
@@ -42,12 +45,20 @@ func InitHandlers(s *State, saveFn func()) {
 }
 
 func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
+	opID := fmt.Sprintf("create-uservm-%s-%d", diskName, time.Now().Unix())
+	log := logger.Get()
+	log.SetOperationID(opID)
+
+	start := time.Now()
+	log.LogOperation("CreateUserVM", diskName, "system")
+
 	var req struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.LogOperationError("CreateUserVM", "decode-request", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -65,41 +76,116 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 	}
 
 	if disk == nil {
+		err := fmt.Errorf("disco no encontrado")
+		log.LogOperationError("CreateUserVM", "find-disk", err)
 		http.Error(w, "Disco no encontrado", http.StatusNotFound)
 		return
 	}
 
-	vmName := fmt.Sprintf("UserVM_%s", req.Name)
+	// Req 14: Validar que el disco es de tipo multiattach o immutable
+	stepStart := time.Now()
+	diskType, err := vboxmanage.GetDiskType(disk.Path)
+	if err != nil {
+		log.LogOperationError("CreateUserVM", "get-disk-type", err)
+		http.Error(w, fmt.Sprintf("Error verificando tipo de disco: %v", err), http.StatusInternalServerError)
+		return
+	}
 
-	// Crear VM
+	diskTypeLower := strings.ToLower(diskType)
+	if !strings.Contains(diskTypeLower, "multiattach") && !strings.Contains(diskTypeLower, "immutable") {
+		err := fmt.Errorf("el disco debe ser de tipo multiattach o immutable, actual: %s", diskType)
+		log.LogOperationError("CreateUserVM", "validate-disk-type", err)
+		http.Error(w, "El disco debe ser convertido a multiconexión o immutable primero", http.StatusBadRequest)
+		return
+	}
+	log.LogOperationStep("Validar tipo de disco", time.Since(stepStart))
+
+	vmName := fmt.Sprintf("UserVM_%s", req.Name)
+	log.Info("Creando VM de usuario: %s", vmName)
+
+	// Verificar si la VM ya existe en VirtualBox
+	stepStart = time.Now()
+	vmExists, err := vboxmanage.VMExists(vmName)
+	if err != nil {
+		log.LogOperationError("CreateUserVM", "check-vm-exists", err)
+		http.Error(w, fmt.Sprintf("Error verificando VM: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if vmExists {
+		err := fmt.Errorf("ya existe una VM con el nombre %s", vmName)
+		log.LogOperationError("CreateUserVM", "vm-already-exists", err)
+		http.Error(w, fmt.Sprintf("Ya existe una VM con el nombre '%s'. Usa otro nombre o elimina la VM existente.", req.Name), http.StatusConflict)
+		return
+	}
+	log.LogOperationStep("Verificar VM no existe", time.Since(stepStart))
+
+	// Req 8: Crear VM
+	stepStart = time.Now()
 	if err := vboxmanage.CreateVM(vmName, "Debian_64"); err != nil {
+		log.LogOperationError("CreateUserVM", "create-vm", err)
 		http.Error(w, fmt.Sprintf("Error creando VM: %v", err), http.StatusInternalServerError)
 		return
 	}
+	log.LogOperationStep("Crear VM", time.Since(stepStart))
 
-	// Configurar VM
-	if err := vboxmanage.ModifyVM(vmName, "--memory", "1024", "--nic1", "bridged", "--bridgeadapter1", state.BridgeAdapter); err != nil {
+	// Req 8: Configurar VM con 1024 MB y adaptador bridge
+	stepStart = time.Now()
+
+	// Obtener el adaptador de red de la VM base
+	var baseVM *BaseVM
+	for i := range state.BaseVMs {
+		if state.BaseVMs[i].Name == disk.SourceVM {
+			baseVM = &state.BaseVMs[i]
+			break
+		}
+	}
+
+	// Obtener info de la VM base para extraer el adaptador de red
+	bridgeAdapter := state.BridgeAdapter // fallback al default
+	if baseVM != nil {
+		baseInfo, err := vboxmanage.GetVMInfo(baseVM.Name)
+		if err == nil {
+			if adapter := baseInfo["bridgeadapter1"]; adapter != "" {
+				bridgeAdapter = adapter
+				log.Info("Usando adaptador de red de VM base: %s", bridgeAdapter)
+			}
+		}
+	}
+
+	if err := vboxmanage.ModifyVM(vmName, "--memory", "1024", "--nic1", "bridged", "--bridgeadapter1", bridgeAdapter); err != nil {
+		log.LogOperationError("CreateUserVM", "configure-vm", err)
 		http.Error(w, fmt.Sprintf("Error configurando VM: %v", err), http.StatusInternalServerError)
 		return
 	}
+	log.LogOperationStep("Configurar VM", time.Since(stepStart))
 
-	// Agregar controlador SATA
+	// Req 8: Agregar controlador SATA
+	stepStart = time.Now()
 	if err := vboxmanage.AddStorageController(vmName, "SATA"); err != nil {
+		log.LogOperationError("CreateUserVM", "add-storage-controller", err)
 		http.Error(w, fmt.Sprintf("Error agregando controlador: %v", err), http.StatusInternalServerError)
 		return
 	}
+	log.LogOperationStep("Agregar controlador SATA", time.Since(stepStart))
 
-	// Conectar disco
-	if err := vboxmanage.AttachDisk(vmName, "SATA", disk.Path); err != nil {
+	// Req 8: Conectar disco usando UUID
+	stepStart = time.Now()
+	if err := vboxmanage.AttachDiskByUUID(vmName, "SATA", disk.UUID); err != nil {
+		log.LogOperationError("CreateUserVM", "attach-disk", err)
 		http.Error(w, fmt.Sprintf("Error conectando disco: %v", err), http.StatusInternalServerError)
 		return
 	}
+	log.LogOperationStep("Conectar disco multiattach", time.Since(stepStart))
 
-	// Iniciar VM
+	// Req 8: Iniciar VM en modo headless
+	stepStart = time.Now()
 	if err := vboxmanage.StartVM(vmName); err != nil {
+		log.LogOperationError("CreateUserVM", "start-vm", err)
 		http.Error(w, fmt.Sprintf("Error iniciando VM: %v", err), http.StatusInternalServerError)
 		return
 	}
+	log.LogOperationStep("Iniciar VM", time.Since(stepStart))
 
 	disk.Connected = true
 
@@ -108,10 +194,15 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 		Description: req.Description,
 		SourceVM:    disk.SourceVM,
 		DiskPath:    disk.Path,
+		DiskUUID:    disk.UUID,
 		State:       "running",
 	})
 
 	saveStateFn()
+
+	log.LogOperationComplete("CreateUserVM", time.Since(start),
+		fmt.Sprintf("VM: %s, Disco: %s", vmName, diskName))
+	log.SetOperationID("")
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "vmName": vmName})
@@ -155,11 +246,19 @@ func HandleUserVMActions(w http.ResponseWriter, r *http.Request) {
 }
 
 func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
+	opID := fmt.Sprintf("create-user-%s-%d", vmName, time.Now().Unix())
+	log := logger.Get()
+	log.SetOperationID(opID)
+
+	start := time.Now()
+	log.LogOperation("CreateUser", vmName, "system")
+
 	var req struct {
 		Username string `json:"username"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.LogOperationError("CreateUser", "decode-request", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -177,20 +276,56 @@ func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
 	}
 
 	if userVM == nil {
+		err := fmt.Errorf("VM no encontrada")
+		log.LogOperationError("CreateUser", "find-vm", err)
 		http.Error(w, "VM no encontrada", http.StatusNotFound)
 		return
 	}
 
-	// Obtener IP de la VM
-	ip, err := vboxmanage.GetVMIP(vmName)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("VM debe estar encendida: %v", err), http.StatusBadRequest)
+	// Req 9: Verificar que la VM está encendida
+	stepStart := time.Now()
+	running, err := vboxmanage.IsVMRunning(vmName)
+	if err != nil || !running {
+		err := fmt.Errorf("la VM debe estar encendida")
+		log.LogOperationError("CreateUser", "check-vm-running", err)
+		http.Error(w, "VM debe estar encendida", http.StatusBadRequest)
 		return
 	}
+	log.LogOperationStep("Verificar VM encendida", time.Since(stepStart))
+
+	// Req 9: Obtener IP de la VM (con reintentos)
+	stepStart = time.Now()
+	var ip string
+	maxRetries := 30              // 30 intentos
+	retryDelay := 5 * time.Second // 5 segundos entre intentos
+
+	log.Info("Esperando a que la VM obtenga una IP (esto puede tomar 1-2 minutos)...")
+
+	for i := 0; i < maxRetries; i++ {
+		ip, err = vboxmanage.GetVMIP(vmName)
+		if err == nil && ip != "" {
+			break
+		}
+
+		if i < maxRetries-1 {
+			log.Debug("Intento %d/%d: IP no disponible aún, esperando %v...", i+1, maxRetries, retryDelay)
+			time.Sleep(retryDelay)
+		}
+	}
+
+	if ip == "" {
+		err := fmt.Errorf("no se pudo obtener IP después de %d intentos (%v)", maxRetries, time.Since(stepStart))
+		log.LogOperationError("CreateUser", "get-vm-ip", err)
+		http.Error(w, "No se pudo obtener IP de la VM. Asegúrate de que la VM tenga VirtualBox Guest Additions instalado y que la red esté configurada correctamente.", http.StatusBadRequest)
+		return
+	}
+	log.LogOperationStep("Obtener IP de VM", time.Since(stepStart))
+	log.Info("IP de la VM: %s", ip)
 
 	userVM.IP = ip
 
-	// Generar llaves para el usuario
+	// Req 9: Generar llaves RSA 1024 para el usuario
+	stepStart = time.Now()
 	keyDir := filepath.Join("keys", vmName, req.Username)
 	os.MkdirAll(keyDir, 0755)
 
@@ -198,9 +333,11 @@ func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
 
 	cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("%s@%s", req.Username, vmName))
 	if err := cmd.Run(); err != nil {
+		log.LogOperationError("CreateUser", "generate-keys", err)
 		http.Error(w, fmt.Sprintf("Error generando llaves: %v", err), http.StatusInternalServerError)
 		return
 	}
+	log.LogOperationStep("Generar llaves SSH", time.Since(stepStart))
 
 	// Leer llave pública
 	pubKeyData, _ := os.ReadFile(keyPath + ".pub")
@@ -209,21 +346,31 @@ func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
 	// Obtener llave root de la VM base
 	rootKeyPath := filepath.Join("keys", userVM.SourceVM, "root", "id_rsa")
 
-	// Crear usuario en la VM
+	// Req 9: Crear usuario en la VM con SSH
+	stepStart = time.Now()
 	if err := CreateUserInVM(ip, rootKeyPath, req.Username, pubKey); err != nil {
+		log.LogOperationError("CreateUser", "create-user-in-vm", err)
 		http.Error(w, fmt.Sprintf("Error creando usuario en VM: %v", err), http.StatusInternalServerError)
 		return
 	}
+	log.LogOperationStep("Crear usuario en VM", time.Since(stepStart))
 
 	userVM.Username = req.Username
 	userVM.HasUserKeys = true
 	saveStateFn()
+
+	log.LogOperationComplete("CreateUser", time.Since(start),
+		fmt.Sprintf("Usuario: %s, VM: %s", req.Username, vmName))
+	log.SetOperationID("")
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func DownloadUserKeys(w http.ResponseWriter, r *http.Request, vmName string) {
+	log := logger.Get()
+	log.Info("Descargando llaves de usuario para VM: %s", vmName)
+
 	state.Mu.RLock()
 	defer state.Mu.RUnlock()
 
@@ -236,6 +383,7 @@ func DownloadUserKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 	}
 
 	if userVM == nil || userVM.Username == "" {
+		log.Error("Usuario no encontrado para VM: %s", vmName)
 		http.Error(w, "Usuario no encontrado", http.StatusNotFound)
 		return
 	}
@@ -243,6 +391,13 @@ func DownloadUserKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 	keyDir := filepath.Join("keys", vmName, userVM.Username)
 	privateKey := filepath.Join(keyDir, "id_rsa")
 	publicKey := filepath.Join(keyDir, "id_rsa.pub")
+
+	// Req 4: Verificar que las llaves existen
+	if _, err := os.Stat(privateKey); os.IsNotExist(err) {
+		log.Error("Llaves no encontradas en: %s", keyDir)
+		http.Error(w, "Llaves no encontradas", http.StatusNotFound)
+		return
+	}
 
 	// Crear ZIP
 	buf := new(bytes.Buffer)
@@ -258,30 +413,47 @@ func DownloadUserKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 
 	zipWriter.Close()
 
+	// Req 4: Enviar ZIP con nombre específico
+	zipName := fmt.Sprintf("%s_%s_keys.zip", vmName, userVM.Username)
+	log.Info("Enviando archivo: %s", zipName)
+
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s_%s_keys.zip", vmName, userVM.Username))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", zipName))
 	w.Write(buf.Bytes())
 }
 
 func DeleteUserVM(w http.ResponseWriter, r *http.Request, vmName string) {
+	opID := fmt.Sprintf("delete-uservm-%s-%d", vmName, time.Now().Unix())
+	log := logger.Get()
+	log.SetOperationID(opID)
+
+	start := time.Now()
+	log.LogOperation("DeleteUserVM", vmName, "system")
+
 	state.Mu.Lock()
 	defer state.Mu.Unlock()
 
 	for i, vm := range state.UserVMs {
 		if vm.Name == vmName {
 			// Apagar VM si está encendida
+			stepStart := time.Now()
 			vboxmanage.PowerOffVM(vmName)
+			log.LogOperationStep("Apagar VM", time.Since(stepStart))
 
 			// Desregistrar VM
+			stepStart = time.Now()
 			if err := vboxmanage.UnregisterVM(vmName); err != nil {
+				log.LogOperationError("DeleteUserVM", "unregister-vm", err)
 				http.Error(w, fmt.Sprintf("Error eliminando VM: %v", err), http.StatusInternalServerError)
 				return
 			}
+			log.LogOperationStep("Desregistrar VM", time.Since(stepStart))
 
-			// Actualizar estado del disco
+			// Req 14: Actualizar estado del disco (mantener disponible)
 			for j := range state.Disks {
-				if state.Disks[j].Path == vm.DiskPath {
+				if state.Disks[j].UUID == vm.DiskUUID {
 					state.Disks[j].Connected = false
+					log.Info("Disco %s marcado como disponible", state.Disks[j].Name)
 					break
 				}
 			}
@@ -290,11 +462,17 @@ func DeleteUserVM(w http.ResponseWriter, r *http.Request, vmName string) {
 			state.UserVMs = append(state.UserVMs[:i], state.UserVMs[i+1:]...)
 			saveStateFn()
 
+			log.LogOperationComplete("DeleteUserVM", time.Since(start), fmt.Sprintf("VM: %s", vmName))
+			log.SetOperationID("")
+
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 			return
 		}
 	}
 
+	err := fmt.Errorf("VM no encontrada")
+	log.LogOperationError("DeleteUserVM", "find-vm", err)
+	log.SetOperationID("")
 	http.Error(w, "VM no encontrada", http.StatusNotFound)
 }
