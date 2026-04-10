@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
+	"vbox-platform/logger"
 )
 
 var vboxPath string
@@ -16,9 +18,12 @@ func Init() {
 	} else {
 		vboxPath = `C:\Program Files\Oracle\VirtualBox\VBoxManage.exe`
 	}
+	logger.Get().Info("VBoxManage inicializado en: %s", vboxPath)
 }
 
 func Run(args ...string) (string, error) {
+	start := time.Now()
+
 	cmd := exec.Command(vboxPath, args...)
 	var out bytes.Buffer
 	var stderr bytes.Buffer
@@ -26,11 +31,17 @@ func Run(args ...string) (string, error) {
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
+	duration := time.Since(start)
+
+	output := out.String()
 	if err != nil {
-		return "", fmt.Errorf("%v: %s", err, stderr.String())
+		errOutput := stderr.String()
+		logger.Get().LogVBoxCommand(vboxPath, args, duration, errOutput, err)
+		return "", fmt.Errorf("%v: %s", err, errOutput)
 	}
 
-	return out.String(), nil
+	logger.Get().LogVBoxCommand(vboxPath, args, duration, output, nil)
+	return output, nil
 }
 
 func ListVMs() ([]string, error) {
@@ -63,12 +74,78 @@ func GetVMInfo(vmName string) (map[string]string, error) {
 	for _, line := range lines {
 		if strings.Contains(line, "=") {
 			parts := strings.SplitN(line, "=", 2)
-			key := strings.TrimSpace(parts[0])
+			key := strings.Trim(strings.TrimSpace(parts[0]), "\"")
 			value := strings.Trim(strings.TrimSpace(parts[1]), "\"")
 			info[key] = value
 		}
 	}
 	return info, nil
+}
+
+func VMExists(vmName string) (bool, error) {
+	vms, err := ListVMs()
+	if err != nil {
+		return false, err
+	}
+
+	for _, vm := range vms {
+		if vm == vmName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func IsVMRunning(vmName string) (bool, error) {
+	info, err := GetVMInfo(vmName)
+	if err != nil {
+		return false, err
+	}
+
+	state := info["VMState"]
+	return state == "running", nil
+}
+
+func GetDiskType(diskPath string) (string, error) {
+	output, err := Run("showmediuminfo", "disk", diskPath)
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "Type:") {
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 {
+				return strings.TrimSpace(parts[1]), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no se pudo determinar el tipo de disco")
+}
+
+func ConvertDiskToMultiAttach(diskPath string) error {
+	_, err := Run("modifymedium", "disk", diskPath, "--type", "immutable")
+	return err
+}
+
+func GetDiskUUID(diskPath string) (string, error) {
+	output, err := Run("showmediuminfo", "disk", diskPath)
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "UUID:") {
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 {
+				uuid := strings.TrimSpace(parts[1])
+				return uuid, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no se pudo obtener UUID del disco")
 }
 
 func StartVM(vmName string) error {
@@ -101,6 +178,11 @@ func GetVMIP(vmName string) (string, error) {
 
 func CloneDisk(source, dest string) error {
 	_, err := Run("clonemedium", "disk", source, dest, "--variant", "MultiAttach")
+	return err
+}
+
+func AttachDiskByUUID(vmName, ctrlName, diskUUID string) error {
+	_, err := Run("storageattach", vmName, "--storagectl", ctrlName, "--port", "0", "--device", "0", "--type", "hdd", "--medium", diskUUID)
 	return err
 }
 

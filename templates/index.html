@@ -5,220 +5,417 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Plataforma VirtualBox</title>
     <link rel="stylesheet" href="/static/style.css">
+    <style>
+        #toast-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .toast {
+            padding: 12px 18px;
+            border-radius: 6px;
+            color: white;
+            font-size: 14px;
+            max-width: 360px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            animation: slideIn 0.2s ease;
+        }
+        .toast.success { background: #28a745; }
+        .toast.error   { background: #dc3545; }
+        .toast.info    { background: #007bff; }
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(40px); }
+            to   { opacity: 1; transform: translateX(0); }
+        }
+        button.loading {
+            opacity: 0.7;
+            cursor: not-allowed;
+        }
+    </style>
 </head>
 <body>
+    <div id="toast-container"></div>
     <div class="container">
         <h1>Plataforma de Gestión de VMs VirtualBox</h1>
-        
+
         <!-- ZONA 1: VMs Base -->
         <section class="zone">
             <h2>VMs Base</h2>
             <div class="form-card">
                 <h3>Agregar VM Base</h3>
-                <input type="text" id="basevm-name" placeholder="Nombre (ej: VM1)">
+                <select id="basevm-name">
+                    <option value="">-- Selecciona una VM de VirtualBox --</option>
+                </select>
                 <input type="text" id="basevm-desc" placeholder="Descripción">
-                <button onclick="addBaseVM()">Agregar VM Base</button>
+                <button id="btn-add-basevm" onclick="addBaseVM()">Agregar VM Base</button>
+                <button onclick="loadVBoxVMs()" style="background:#6c757d">↻ Refrescar VMs</button>
             </div>
             <div id="basevms-list"></div>
         </section>
-        
+
         <!-- ZONA 2: Discos Multiconexión -->
         <section class="zone">
             <h2>Discos Multiconexión</h2>
             <div id="disks-list"></div>
         </section>
-        
+
         <!-- ZONA 3: VMs de Usuario -->
         <section class="zone">
             <h2>VMs de Usuario</h2>
             <div id="uservms-list"></div>
         </section>
     </div>
-    
+
     <script>
         let state = {};
-        
-        async function loadState() {
-            const res = await fetch('/api/state');
-            state = await res.json();
-            renderAll();
+
+        // ── Toast ──────────────────────────────────────────────
+        function toast(msg, type = 'info', duration = 4000) {
+            const container = document.getElementById('toast-container');
+            const el = document.createElement('div');
+            el.className = `toast ${type}`;
+            el.textContent = msg;
+            container.appendChild(el);
+            setTimeout(() => el.remove(), duration);
         }
-        
+
+        // ── Botón con estado de carga ──────────────────────────
+        function setBtnLoading(btn, loading, originalText) {
+            if (loading) {
+                btn.dataset.original = btn.textContent;
+                btn.textContent = '⏳ Procesando...';
+                btn.disabled = true;
+                btn.classList.add('loading');
+            } else {
+                btn.textContent = originalText ?? btn.dataset.original;
+                btn.disabled = false;
+                btn.classList.remove('loading');
+            }
+        }
+
+        // ── API helper ─────────────────────────────────────────
+        async function api(url, method = 'GET', body = null) {
+            const opts = { method, headers: {} };
+            if (body) {
+                opts.headers['Content-Type'] = 'application/json';
+                opts.body = JSON.stringify(body);
+            }
+            const res = await fetch(url, opts);
+            const text = await res.text();
+            if (!res.ok) throw new Error(text || `Error ${res.status}`);
+            return text ? JSON.parse(text) : null;
+        }
+
+        // ── Estado ─────────────────────────────────────────────
+        async function loadState() {
+            try {
+                const res = await fetch('/api/state');
+                state = await res.json();
+                renderAll();
+            } catch (e) {
+                console.error('Error cargando estado', e);
+            }
+        }
+
         function renderAll() {
             renderBaseVMs();
             renderDisks();
             renderUserVMs();
         }
-        
+
+        // ── Zona 1 ─────────────────────────────────────────────
         function renderBaseVMs() {
             const container = document.getElementById('basevms-list');
             container.innerHTML = '';
-            
-            state.baseVMs.forEach(vm => {
+            if (!state.baseVMs?.length) {
+                container.innerHTML = '<p style="color:#999">No hay VMs base registradas.</p>';
+                return;
+            }
+            for (const vm of state.baseVMs) {
                 const card = document.createElement('div');
                 card.className = 'card';
+                
+                // Req 10: Controles dinámicos según estado
+                const rootKeysDisabled = vm.hasRootKeys ? 'disabled' : '';
+                const downloadRootDisabled = vm.hasRootKeys ? '' : 'disabled';
+                const diskDisabled = (vm.hasRootKeys && !vm.diskConverted) ? '' : 'disabled';
+                
                 card.innerHTML = `
                     <h3>${vm.name}</h3>
-                    <p>${vm.description}</p>
-                    <p>Llaves root: ${vm.hasRootKeys ? '✓' : '✗'}</p>
-                    <p>Disco creado: ${vm.diskCreated ? '✓' : '✗'}</p>
-                    <button onclick="createRootKeys('${vm.name}')" ${vm.hasRootKeys ? 'disabled' : ''}>
-                        Crear llaves de root
+                    <p>${vm.description || '<em>Sin descripción</em>'}</p>
+                    <p>Llaves root: ${vm.hasRootKeys ? '✅' : '❌'}</p>
+                    <p>Disco convertido: ${vm.diskConverted ? '✅' : '❌'}</p>
+                    ${vm.diskPath ? `<p><small>Disco: ${vm.diskPath}</small></p>` : ''}
+                    ${vm.diskUUID ? `<p><small>UUID: ${vm.diskUUID}</small></p>` : ''}
+                    <button id="btn-rootkeys-${vm.name}" onclick="createRootKeys('${vm.name}')" ${rootKeysDisabled}>
+                        ${vm.hasRootKeys ? '✓ Llaves creadas' : 'Crear llaves de root'}
                     </button>
-                    <button onclick="downloadRootKeys('${vm.name}')" ${!vm.hasRootKeys ? 'disabled' : ''}>
+                    <button onclick="downloadRootKeys('${vm.name}')" ${downloadRootDisabled}>
                         Descargar llaves de root
                     </button>
-                    <button onclick="createDisk('${vm.name}')" ${!vm.hasRootKeys || vm.diskCreated ? 'disabled' : ''}>
-                        Crear disco multiconexión
+                    <button id="btn-disk-${vm.name}" onclick="createDisk('${vm.name}')" ${diskDisabled}>
+                        ${vm.diskConverted ? '✓ Disco convertido' : 'Convertir disco a multiconexión'}
                     </button>
                 `;
                 container.appendChild(card);
-            });
+            }
         }
-        
+
+        // ── Zona 2 ─────────────────────────────────────────────
         function renderDisks() {
             const container = document.getElementById('disks-list');
+            
+            // Guardar valores actuales de los inputs antes de re-renderizar
+            const savedValues = {};
+            if (!state.disks?.length) {
+                container.innerHTML = '<p style="color:#999">No hay discos multiconexión.</p>';
+                return;
+            }
+            
+            for (const disk of state.disks) {
+                const nameInput = document.getElementById(`uservm-name-${disk.name}`);
+                const descInput = document.getElementById(`uservm-desc-${disk.name}`);
+                if (nameInput) savedValues[`name-${disk.name}`] = nameInput.value;
+                if (descInput) savedValues[`desc-${disk.name}`] = descInput.value;
+            }
+            
             container.innerHTML = '';
             
-            state.disks.forEach(disk => {
+            for (const disk of state.disks) {
                 const card = document.createElement('div');
                 card.className = 'card';
                 card.innerHTML = `
                     <h3>${disk.name}</h3>
                     <p>VM origen: ${disk.sourceVM}</p>
-                    <p>Estado: ${disk.connected ? 'Conectado' : 'Desconectado'}</p>
-                    <p><small>${disk.path}</small></p>
+                    <p>Estado: ${disk.connected ? '🟢 Conectado' : '⚪ Desconectado'}</p>
+                    <p><small>UUID: ${disk.uuid || 'N/A'}</small></p>
+                    <p><small>Path: ${disk.path}</small></p>
                     <div class="form-inline">
-                        <input type="text" id="uservm-name-${disk.name}" placeholder="Nombre VM">
-                        <input type="text" id="uservm-desc-${disk.name}" placeholder="Descripción">
-                        <button onclick="createUserVM('${disk.name}')">Crear VM de usuario</button>
+                        <input type="text" id="uservm-name-${disk.name}" placeholder="Nombre VM usuario" value="${savedValues[`name-${disk.name}`] || ''}">
+                        <input type="text" id="uservm-desc-${disk.name}" placeholder="Descripción" value="${savedValues[`desc-${disk.name}`] || ''}">
+                        <button id="btn-createuservm-${disk.name}" onclick="createUserVM('${disk.name}')">Crear VM de usuario</button>
                     </div>
-                    <button onclick="connectDisk('${disk.name}')" ${disk.connected ? 'disabled' : ''}>
-                        Conectar disco
-                    </button>
-                    <button onclick="disconnectDisk('${disk.name}')" ${!disk.connected ? 'disabled' : ''}>
-                        Desconectar disco
-                    </button>
-                    <button onclick="deleteDisk('${disk.name}')" class="danger">
-                        Eliminar disco
-                    </button>
+                    <button id="btn-connect-${disk.name}" onclick="connectDisk('${disk.name}')" ${disk.connected ? 'disabled' : ''}>Conectar disco</button>
+                    <button id="btn-disconnect-${disk.name}" onclick="disconnectDisk('${disk.name}')" ${disk.connected ? '' : 'disabled'}>Desconectar disco</button>
+                    <button id="btn-deletedisk-${disk.name}" onclick="deleteDisk('${disk.name}')" class="danger">Eliminar disco</button>
                 `;
                 container.appendChild(card);
-            });
+            }
         }
-        
+
+        // ── Zona 3 ─────────────────────────────────────────────
         function renderUserVMs() {
             const container = document.getElementById('uservms-list');
+            
+            // Guardar valores actuales de los inputs antes de re-renderizar
+            const savedValues = {};
+            if (!state.userVMs?.length) {
+                container.innerHTML = '<p style="color:#999">No hay VMs de usuario.</p>';
+                return;
+            }
+            
+            for (const vm of state.userVMs) {
+                const usernameInput = document.getElementById(`username-${vm.name}`);
+                if (usernameInput) savedValues[`username-${vm.name}`] = usernameInput.value;
+            }
+            
             container.innerHTML = '';
             
-            state.userVMs.forEach(vm => {
+            for (const vm of state.userVMs) {
                 const card = document.createElement('div');
                 card.className = 'card';
+                
+                // Req 10: Habilitar descarga solo cuando hasUserKeys es true
+                const downloadUserDisabled = vm.hasUserKeys ? '' : 'disabled';
+                
                 card.innerHTML = `
                     <h3>${vm.name}</h3>
-                    <p>${vm.description}</p>
+                    <p>${vm.description || '<em>Sin descripción</em>'}</p>
+                    <p>VM origen: ${vm.sourceVM}</p>
                     <p>Estado: ${vm.state || 'desconocido'}</p>
                     <p>IP: ${vm.ip || 'N/A'}</p>
-                    <p>Usuario: ${vm.username || 'N/A'}</p>
+                    <p>Usuario: ${vm.username || 'N/A'} ${vm.hasUserKeys ? '✅' : ''}</p>
+                    ${vm.diskUUID ? `<p><small>Disco UUID: ${vm.diskUUID}</small></p>` : ''}
                     <div class="form-inline">
-                        <input type="text" id="username-${vm.name}" placeholder="Nombre de usuario">
-                        <button onclick="createUser('${vm.name}')">Crear usuario</button>
+                        <input type="text" id="username-${vm.name}" placeholder="Nombre de usuario" value="${savedValues[`username-${vm.name}`] || ''}">
+                        <button id="btn-createuser-${vm.name}" onclick="createUser('${vm.name}')">Crear usuario</button>
                     </div>
-                    <button onclick="downloadUserKeys('${vm.name}')" ${!vm.hasUserKeys ? 'disabled' : ''}>
-                        Descargar llaves de usuario
-                    </button>
-                    <button onclick="deleteUserVM('${vm.name}')" class="danger">
-                        Eliminar VM
-                    </button>
+                    <button onclick="downloadUserKeys('${vm.name}')" ${downloadUserDisabled}>Descargar llaves de usuario</button>
+                    <button id="btn-deleteuservm-${vm.name}" onclick="deleteUserVM('${vm.name}')" class="danger">Eliminar VM</button>
                 `;
                 container.appendChild(card);
-            });
+            }
         }
-        
+
+        // ── Acciones Zona 1 ────────────────────────────────────
         async function addBaseVM() {
             const name = document.getElementById('basevm-name').value;
             const description = document.getElementById('basevm-desc').value;
-            
-            await fetch('/api/basevms', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({name, description})
-            });
-            
-            document.getElementById('basevm-name').value = '';
-            document.getElementById('basevm-desc').value = '';
-            loadState();
+            if (!name) { toast('Selecciona una VM de VirtualBox', 'error'); return; }
+
+            const btn = document.getElementById('btn-add-basevm');
+            setBtnLoading(btn, true);
+            try {
+                await api('/api/basevms', 'POST', { name, description });
+                toast(`VM base "${name}" agregada correctamente`, 'success');
+                document.getElementById('basevm-desc').value = '';
+                await loadState();
+            } catch (e) {
+                toast(`Error al agregar VM base: ${e.message}`, 'error');
+            } finally {
+                setBtnLoading(btn, false);
+            }
         }
-        
+
         async function createRootKeys(vmName) {
-            await fetch(`/api/basevms/${vmName}/rootkeys`, {method: 'POST'});
-            loadState();
+            const btn = document.getElementById(`btn-rootkeys-${vmName}`);
+            setBtnLoading(btn, true);
+            try {
+                await api(`/api/basevms/${vmName}/rootkeys`, 'POST');
+                toast(`Llaves de root creadas para "${vmName}"`, 'success');
+                await loadState();
+            } catch (e) {
+                toast(`Error creando llaves: ${e.message}`, 'error');
+                setBtnLoading(btn, false);
+            }
         }
-        
+
         function downloadRootKeys(vmName) {
-            window.location.href = `/api/basevms/${vmName}/rootkeys/download`;
+            toast(`Descargando llaves de root de "${vmName}"...`, 'info');
+            globalThis.location.href = `/api/basevms/${vmName}/rootkeys/download`;
         }
-        
+
         async function createDisk(vmName) {
-            await fetch(`/api/basevms/${vmName}/disk`, {method: 'POST'});
-            loadState();
+            const btn = document.getElementById(`btn-disk-${vmName}`);
+            setBtnLoading(btn, true);
+            try {
+                await api(`/api/basevms/${vmName}/disk`, 'POST');
+                toast(`Disco multiconexión creado para "${vmName}"`, 'success');
+                await loadState();
+            } catch (e) {
+                toast(`Error creando disco: ${e.message}`, 'error');
+                setBtnLoading(btn, false);
+            }
         }
-        
+
+        // ── Acciones Zona 2 ────────────────────────────────────
         async function createUserVM(diskName) {
             const name = document.getElementById(`uservm-name-${diskName}`).value;
             const description = document.getElementById(`uservm-desc-${diskName}`).value;
-            
-            await fetch(`/api/disks/${diskName}/uservms`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({name, description})
-            });
-            
-            loadState();
-        }
-        
-        async function connectDisk(diskName) {
-            await fetch(`/api/disks/${diskName}/connect`, {method: 'POST'});
-            loadState();
-        }
-        
-        async function disconnectDisk(diskName) {
-            await fetch(`/api/disks/${diskName}/disconnect`, {method: 'POST'});
-            loadState();
-        }
-        
-        async function deleteDisk(diskName) {
-            if (confirm('¿Eliminar disco?')) {
-                await fetch(`/api/disks/${diskName}`, {method: 'DELETE'});
-                loadState();
+            if (!name) { toast('Ingresa un nombre para la VM de usuario', 'error'); return; }
+
+            const btn = document.getElementById(`btn-createuservm-${diskName}`);
+            setBtnLoading(btn, true);
+            try {
+                await api(`/api/disks/${diskName}/uservms`, 'POST', { name, description });
+                toast(`VM de usuario "${name}" creada correctamente`, 'success');
+                await loadState();
+            } catch (e) {
+                toast(`Error creando VM de usuario: ${e.message}`, 'error');
+                setBtnLoading(btn, false);
             }
         }
-        
+
+        async function connectDisk(diskName) {
+            const btn = document.getElementById(`btn-connect-${diskName}`);
+            setBtnLoading(btn, true);
+            try {
+                await api(`/api/disks/${diskName}/connect`, 'POST');
+                toast(`Disco "${diskName}" conectado`, 'success');
+                await loadState();
+            } catch (e) {
+                toast(`Error conectando disco: ${e.message}`, 'error');
+                setBtnLoading(btn, false);
+            }
+        }
+
+        async function disconnectDisk(diskName) {
+            const btn = document.getElementById(`btn-disconnect-${diskName}`);
+            setBtnLoading(btn, true);
+            try {
+                await api(`/api/disks/${diskName}/disconnect`, 'POST');
+                toast(`Disco "${diskName}" desconectado`, 'success');
+                await loadState();
+            } catch (e) {
+                toast(`Error desconectando disco: ${e.message}`, 'error');
+                setBtnLoading(btn, false);
+            }
+        }
+
+        async function deleteDisk(diskName) {
+            if (!confirm(`¿Eliminar el disco "${diskName}"? Esta acción no se puede deshacer.`)) return;
+            const btn = document.getElementById(`btn-deletedisk-${diskName}`);
+            setBtnLoading(btn, true);
+            try {
+                await api(`/api/disks/${diskName}`, 'DELETE');
+                toast(`Disco "${diskName}" eliminado`, 'success');
+                await loadState();
+            } catch (e) {
+                toast(`Error eliminando disco: ${e.message}`, 'error');
+                setBtnLoading(btn, false);
+            }
+        }
+
+        // ── Acciones Zona 3 ────────────────────────────────────
         async function createUser(vmName) {
             const username = document.getElementById(`username-${vmName}`).value;
-            
-            await fetch(`/api/uservms/${vmName}/user`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({username})
-            });
-            
-            loadState();
-        }
-        
-        function downloadUserKeys(vmName) {
-            window.location.href = `/api/uservms/${vmName}/keys/download`;
-        }
-        
-        async function deleteUserVM(vmName) {
-            if (confirm('¿Eliminar VM de usuario?')) {
-                await fetch(`/api/uservms/${vmName}`, {method: 'DELETE'});
-                loadState();
+            if (!username) { toast('Ingresa un nombre de usuario', 'error'); return; }
+
+            const btn = document.getElementById(`btn-createuser-${vmName}`);
+            setBtnLoading(btn, true);
+            try {
+                await api(`/api/uservms/${vmName}/user`, 'POST', { username });
+                toast(`Usuario "${username}" creado en "${vmName}"`, 'success');
+                await loadState();
+            } catch (e) {
+                toast(`Error creando usuario: ${e.message}`, 'error');
+                setBtnLoading(btn, false);
             }
         }
-        
-        // Cargar estado inicial y refrescar cada 5 segundos
+
+        function downloadUserKeys(vmName) {
+            toast(`Descargando llaves de usuario de "${vmName}"...`, 'info');
+            globalThis.location.href = `/api/uservms/${vmName}/keys/download`;
+        }
+
+        async function deleteUserVM(vmName) {
+            if (!confirm(`¿Eliminar la VM "${vmName}"? Esta acción no se puede deshacer.`)) return;
+            const btn = document.getElementById(`btn-deleteuservm-${vmName}`);
+            setBtnLoading(btn, true);
+            try {
+                await api(`/api/uservms/${vmName}`, 'DELETE');
+                toast(`VM "${vmName}" eliminada`, 'success');
+                await loadState();
+            } catch (e) {
+                toast(`Error eliminando VM: ${e.message}`, 'error');
+                setBtnLoading(btn, false);
+            }
+        }
+
+        // ── Init ───────────────────────────────────────────────
+        async function loadVBoxVMs() {
+            try {
+                const vms = await api('/api/vboxvms');
+                const select = document.getElementById('basevm-name');
+                select.innerHTML = '<option value="">-- Selecciona una VM de VirtualBox --</option>';
+                for (const name of (vms || [])) {
+                    const opt = document.createElement('option');
+                    opt.value = name;
+                    opt.textContent = name;
+                    select.appendChild(opt);
+                }
+                if (!vms?.length) toast('No se encontraron VMs en VirtualBox', 'info');
+            } catch (e) {
+                toast(`Error al listar VMs de VirtualBox: ${e.message}`, 'error');
+            }
+        }
+
         loadState();
+        loadVBoxVMs();
         setInterval(loadState, 5000);
     </script>
 </body>
