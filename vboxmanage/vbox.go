@@ -174,7 +174,12 @@ func ResolveBaseDiskPath(diskRef string) (string, error) {
 }
 
 func ConvertDiskToMultiAttach(diskPath string) error {
-	_, err := Run("modifymedium", "disk", diskPath, "--type", "multiattach")
+	err := ConvertDiskType(diskPath, "multiattach")
+	return err
+}
+
+func ConvertDiskType(diskPath, diskType string) error {
+	_, err := Run("modifymedium", "disk", diskPath, "--type", diskType)
 	return err
 }
 

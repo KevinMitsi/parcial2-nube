@@ -327,17 +327,40 @@ func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
 	// Req 9: Generar llaves RSA 1024 para el usuario
 	stepStart = time.Now()
 	keyDir := filepath.Join("keys", vmName, req.Username)
-	os.MkdirAll(keyDir, 0755)
-
-	keyPath := filepath.Join(keyDir, "id_rsa")
-
-	cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("%s@%s", req.Username, vmName))
-	if err := cmd.Run(); err != nil {
-		log.LogOperationError("CreateUser", "generate-keys", err)
-		http.Error(w, fmt.Sprintf("Error generando llaves: %v", err), http.StatusInternalServerError)
+	if err := os.MkdirAll(keyDir, 0755); err != nil {
+		log.LogOperationError("CreateUser", "create-key-dir", err)
+		http.Error(w, fmt.Sprintf("Error creando directorio de llaves: %v", err), http.StatusInternalServerError)
 		return
 	}
-	log.LogOperationStep("Generar llaves SSH", time.Since(stepStart))
+
+	keyPath := filepath.Join(keyDir, "id_rsa")
+	pubKeyPath := keyPath + ".pub"
+
+	// Si las llaves ya existen de un intento previo, reutilizarlas.
+	if _, errPriv := os.Stat(keyPath); errPriv == nil {
+		if _, errPub := os.Stat(pubKeyPath); errPub == nil {
+			log.Info("Llaves de usuario ya existentes en: %s", keyDir)
+			log.LogOperationStep("Reutilizar llaves SSH existentes", time.Since(stepStart))
+		} else {
+			cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("%s@%s", req.Username, vmName))
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				log.LogOperationError("CreateUser", "generate-keys", err)
+				http.Error(w, fmt.Sprintf("Error generando llaves: %v | output: %s", err, string(out)), http.StatusInternalServerError)
+				return
+			}
+			log.LogOperationStep("Generar llaves SSH", time.Since(stepStart))
+		}
+	} else {
+		cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("%s@%s", req.Username, vmName))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			log.LogOperationError("CreateUser", "generate-keys", err)
+			http.Error(w, fmt.Sprintf("Error generando llaves: %v | output: %s", err, string(out)), http.StatusInternalServerError)
+			return
+		}
+		log.LogOperationStep("Generar llaves SSH", time.Since(stepStart))
+	}
 
 	// Leer llave pública
 	pubKeyData, _ := os.ReadFile(keyPath + ".pub")
