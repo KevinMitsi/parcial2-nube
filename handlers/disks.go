@@ -45,6 +45,22 @@ func CreateMultiAttachDisk(w http.ResponseWriter, r *http.Request, vmName string
 		return
 	}
 
+	if baseVM.DiskConverted {
+		diskPathLower := strings.ToLower(baseVM.DiskPath)
+		if !strings.Contains(diskPathLower, "\\disks\\") && !strings.Contains(diskPathLower, "/disks/") {
+			log.Info("La VM base ya tiene disco preparado directamente desde origen: %s", baseVM.DiskPath)
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":   "already_exists",
+				"diskPath": baseVM.DiskPath,
+				"diskUUID": baseVM.DiskUUID,
+			})
+			return
+		}
+
+		log.Warn("Se detectó estado antiguo con disco clonado, se migrará a disco padre directo")
+	}
+
 	// Req 5: Validar que existan llaves de root
 	if !baseVM.HasRootKeys {
 		err := fmt.Errorf("debe crear llaves de root primero")
@@ -62,6 +78,42 @@ func CreateMultiAttachDisk(w http.ResponseWriter, r *http.Request, vmName string
 		return
 	}
 	log.LogOperationStep("Obtener info de VM", time.Since(stepStart))
+
+	vmState := strings.ToLower(info["VMState"])
+	if vmState != "poweroff" {
+		log.Info("VM %s está en estado '%s', apagándola antes de convertir disco...", vmName, vmState)
+
+		// Intentar apagar la VM
+		stepStart = time.Now()
+		if err := vboxmanage.PowerOffVM(vmName); err != nil {
+			log.LogOperationError("CreateMultiAttachDisk", "poweroff-vm", err)
+			http.Error(w, fmt.Sprintf("No se pudo apagar la VM automáticamente (estado: %s): %v. Apágala manualmente desde VirtualBox e intenta de nuevo.", vmState, err), http.StatusBadRequest)
+			return
+		}
+		log.LogOperationStep("Apagar VM antes de conversión", time.Since(stepStart))
+
+		// Esperar un momento para asegurar que la VM se apagó completamente
+		log.Info("Esperando a que la VM se apague completamente...")
+		time.Sleep(3 * time.Second)
+
+		// Verificar que efectivamente se apagó
+		stepStart = time.Now()
+		info, err = vboxmanage.GetVMInfo(vmName)
+		if err != nil {
+			log.LogOperationError("CreateMultiAttachDisk", "verify-vm-poweroff", err)
+			http.Error(w, fmt.Sprintf("Error verificando estado de VM después de apagar: %v", err), http.StatusInternalServerError)
+			return
+		}
+		vmState = strings.ToLower(info["VMState"])
+		if vmState != "poweroff" {
+			err := fmt.Errorf("VM no se apagó correctamente, estado actual: %s", vmState)
+			log.LogOperationError("CreateMultiAttachDisk", "validate-vm-poweroff-after", err)
+			http.Error(w, fmt.Sprintf("La VM no se apagó correctamente (estado: %s). Apágala manualmente desde VirtualBox e intenta de nuevo.", vmState), http.StatusBadRequest)
+			return
+		}
+		log.LogOperationStep("Verificar VM apagada", time.Since(stepStart))
+		log.Info("VM apagada exitosamente, continuando con conversión de disco...")
+	}
 
 	// Buscar el disco principal (SATA-0-0)
 	originalDisk := info["SATA-0-0"]
@@ -85,53 +137,62 @@ func CreateMultiAttachDisk(w http.ResponseWriter, r *http.Request, vmName string
 	log.LogOperationStep("Verificar tipo de disco", time.Since(stepStart))
 	log.Info("Tipo de disco actual: %s", diskType)
 
-	// Req 6: Verificar si ya es multiattach
-	if strings.Contains(strings.ToLower(diskType), "multiattach") {
-		err := fmt.Errorf("el disco ya es de tipo multiconexión")
-		log.LogOperationError("CreateMultiAttachDisk", "disk-already-multiattach", err)
-		http.Error(w, "El disco ya fue convertido a multiconexión", http.StatusConflict)
+	targetDiskPath := originalDisk
+	if strings.Contains(strings.ToLower(diskType), "differencing") {
+		stepStart = time.Now()
+		baseDiskPath, resolveErr := vboxmanage.ResolveBaseDiskPath(originalDisk)
+		if resolveErr != nil {
+			log.LogOperationError("CreateMultiAttachDisk", "resolve-base-disk", resolveErr)
+			http.Error(w, fmt.Sprintf("Error resolviendo disco base desde snapshot: %v", resolveErr), http.StatusInternalServerError)
+			return
+		}
+		targetDiskPath = baseDiskPath
+		log.LogOperationStep("Resolver disco base desde cadena de snapshots", time.Since(stepStart))
+		log.Info("Disco padre para conversión: %s", targetDiskPath)
+	}
+
+	// Verificar tipo del disco objetivo (padre) antes de convertir.
+	stepStart = time.Now()
+	targetDiskType, err := vboxmanage.GetDiskType(targetDiskPath)
+	if err != nil {
+		log.LogOperationError("CreateMultiAttachDisk", "get-target-disk-type", err)
+		http.Error(w, fmt.Sprintf("Error obteniendo tipo del disco padre: %v", err), http.StatusInternalServerError)
 		return
 	}
+	log.LogOperationStep("Verificar tipo de disco padre", time.Since(stepStart))
+	log.Info("Tipo de disco padre: %s", targetDiskType)
 
-	// Obtener el nombre del controlador SATA
-	storageCtrl := info["storagecontrollername1"]
-	if storageCtrl == "" {
-		storageCtrl = "SATA" // fallback al nombre por defecto
+	targetTypeLower := strings.ToLower(targetDiskType)
+	if strings.Contains(targetTypeLower, "immutable") {
+		stepStart = time.Now()
+		if err := vboxmanage.ConvertDiskType(targetDiskPath, "normal"); err != nil {
+			log.LogOperationError("CreateMultiAttachDisk", "convert-disk-to-normal", err)
+			http.Error(w, fmt.Sprintf("Error cambiando disco padre a tipo normal: %v", err), http.StatusInternalServerError)
+			return
+		}
+		log.LogOperationStep("Convertir disco padre a normal", time.Since(stepStart))
+		targetTypeLower = "normal"
 	}
-	log.Info("Controlador de almacenamiento: %s", storageCtrl)
 
-	// Desconectar el disco de la VM antes de convertirlo
-	stepStart = time.Now()
-	if err := vboxmanage.DetachDisk(vmName, storageCtrl); err != nil {
-		log.LogOperationError("CreateMultiAttachDisk", "detach-disk", err)
-		http.Error(w, fmt.Sprintf("Error desconectando disco: %v", err), http.StatusInternalServerError)
-		return
+	if !strings.Contains(targetTypeLower, "multiattach") {
+		stepStart = time.Now()
+		if err := vboxmanage.ConvertDiskToMultiAttach(targetDiskPath); err != nil {
+			errText := strings.ToLower(err.Error())
+			if strings.Contains(errText, "can only be used on media registered with a machine that was created with virtualbox 4.0 or later") ||
+				strings.Contains(errText, "vbox_e_invalid_object_state") {
+				log.Warn("VBox no permitió cambiar tipo del disco padre a multiattach; se continuará con adjunto en modo multiattach por VM. Error: %v", err)
+			} else {
+				log.LogOperationError("CreateMultiAttachDisk", "convert-parent-disk-multiattach", err)
+				http.Error(w, fmt.Sprintf("Error convirtiendo disco padre a multiattach: %v", err), http.StatusInternalServerError)
+				return
+			}
+		}
+		log.LogOperationStep("Convertir disco padre a multiattach", time.Since(stepStart))
 	}
-	log.LogOperationStep("Desconectar disco de VM", time.Since(stepStart))
 
-	// Convertir disco a multiattach
+	// Obtener UUID del disco padre (el que compartirán las VMs hijas)
 	stepStart = time.Now()
-	if err := vboxmanage.ConvertDiskToMultiAttach(originalDisk); err != nil {
-		// Si falla, intentar reconectar el disco
-		vboxmanage.AttachDisk(vmName, storageCtrl, originalDisk)
-		log.LogOperationError("CreateMultiAttachDisk", "convert-disk", err)
-		http.Error(w, fmt.Sprintf("Error convirtiendo disco: %v", err), http.StatusInternalServerError)
-		return
-	}
-	log.LogOperationStep("Convertir disco a multiattach", time.Since(stepStart))
-
-	// Reconectar el disco a la VM
-	stepStart = time.Now()
-	if err := vboxmanage.AttachDisk(vmName, storageCtrl, originalDisk); err != nil {
-		log.LogOperationError("CreateMultiAttachDisk", "reattach-disk", err)
-		http.Error(w, fmt.Sprintf("Error reconectando disco: %v", err), http.StatusInternalServerError)
-		return
-	}
-	log.LogOperationStep("Reconectar disco a VM", time.Since(stepStart))
-
-	// Obtener UUID del disco
-	stepStart = time.Now()
-	diskUUID, err := vboxmanage.GetDiskUUID(originalDisk)
+	diskUUID, err := vboxmanage.GetDiskUUID(targetDiskPath)
 	if err != nil {
 		log.LogOperationError("CreateMultiAttachDisk", "get-disk-uuid", err)
 		http.Error(w, fmt.Sprintf("Error obteniendo UUID: %v", err), http.StatusInternalServerError)
@@ -143,14 +204,35 @@ func CreateMultiAttachDisk(w http.ResponseWriter, r *http.Request, vmName string
 	// Actualizar estado
 	baseVM.DiskCreated = true
 	baseVM.DiskConverted = true
-	baseVM.DiskPath = originalDisk
+	baseVM.DiskPath = targetDiskPath
 	baseVM.DiskUUID = diskUUID
 
 	diskName := fmt.Sprintf("%s_multiattach", vmName)
+	for i := range state.Disks {
+		if state.Disks[i].Name == diskName {
+			state.Disks[i].Path = targetDiskPath
+			state.Disks[i].UUID = diskUUID
+			state.Disks[i].SourceVM = vmName
+			saveStateFn()
+
+			log.LogOperationComplete("CreateMultiAttachDisk", time.Since(start),
+				fmt.Sprintf("Disco: %s, UUID: %s, Path: %s", diskName, diskUUID, targetDiskPath))
+			log.SetOperationID("")
+
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":   "ok",
+				"diskPath": targetDiskPath,
+				"diskUUID": diskUUID,
+			})
+			return
+		}
+	}
+
 	state.Disks = append(state.Disks, Disk{
 		Name:      diskName,
 		SourceVM:  vmName,
-		Path:      originalDisk,
+		Path:      targetDiskPath,
 		UUID:      diskUUID,
 		Connected: false,
 	})
@@ -164,7 +246,7 @@ func CreateMultiAttachDisk(w http.ResponseWriter, r *http.Request, vmName string
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":   "ok",
-		"diskPath": originalDisk,
+		"diskPath": targetDiskPath,
 		"diskUUID": diskUUID,
 	})
 }

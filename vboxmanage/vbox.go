@@ -124,8 +124,62 @@ func GetDiskType(diskPath string) (string, error) {
 	return "", fmt.Errorf("no se pudo determinar el tipo de disco")
 }
 
+func getDiskInfo(diskRef string) (map[string]string, error) {
+	output, err := Run("showmediuminfo", "disk", diskRef)
+	if err != nil {
+		return nil, err
+	}
+
+	info := make(map[string]string)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, ":") {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		info[key] = value
+	}
+
+	return info, nil
+}
+
+func ResolveBaseDiskPath(diskRef string) (string, error) {
+	visited := make(map[string]bool)
+	current := diskRef
+
+	for {
+		info, err := getDiskInfo(current)
+		if err != nil {
+			return "", err
+		}
+
+		location := info["Location"]
+		if location == "" {
+			location = current
+		}
+
+		parentUUID := strings.ToLower(strings.TrimSpace(info["Parent UUID"]))
+		if parentUUID == "" || parentUUID == "base" || parentUUID == "none" || parentUUID == "null" {
+			return location, nil
+		}
+
+		if visited[parentUUID] {
+			return "", fmt.Errorf("cadena de discos con ciclo detectado en Parent UUID: %s", parentUUID)
+		}
+		visited[parentUUID] = true
+		current = parentUUID
+	}
+}
+
 func ConvertDiskToMultiAttach(diskPath string) error {
-	_, err := Run("modifymedium", "disk", diskPath, "--type", "immutable")
+	err := ConvertDiskType(diskPath, "multiattach")
+	return err
+}
+
+func ConvertDiskType(diskPath, diskType string) error {
+	_, err := Run("modifymedium", "disk", diskPath, "--type", diskType)
 	return err
 }
 
@@ -177,13 +231,19 @@ func GetVMIP(vmName string) (string, error) {
 }
 
 func CloneDisk(source, dest string) error {
-	_, err := Run("clonemedium", "disk", source, dest, "--variant", "MultiAttach")
+	_, err := Run("clonemedium", "disk", source, dest, "--format", "VDI")
 	return err
 }
 
 func AttachDiskByUUID(vmName, ctrlName, diskUUID string) error {
-	_, err := Run("storageattach", vmName, "--storagectl", ctrlName, "--port", "0", "--device", "0", "--type", "hdd", "--medium", diskUUID)
-	return err
+	_, err := Run("storageattach", vmName, "--storagectl", ctrlName, "--port", "0", "--device", "0", "--type", "hdd", "--medium", diskUUID, "--mtype", "multiattach")
+	if err == nil {
+		return nil
+	}
+
+	logger.Get().Warn("No se pudo adjuntar con --mtype multiattach, reintentando adjunto estándar: %v", err)
+	_, fallbackErr := Run("storageattach", vmName, "--storagectl", ctrlName, "--port", "0", "--device", "0", "--type", "hdd", "--medium", diskUUID)
+	return fallbackErr
 }
 
 func CreateVM(name, ostype string) error {
@@ -219,5 +279,88 @@ func UnregisterVM(vmName string) error {
 
 func DeleteDisk(diskPath string) error {
 	_, err := Run("closemedium", "disk", diskPath, "--delete")
+	return err
+}
+
+func GuestCopyTo(vmName, username, password, sourcePath, destPath string) error {
+	_, err := Run("guestcontrol", vmName, "copyto", sourcePath, destPath, "--username", username, "--password", password)
+	return err
+}
+
+func GuestCopyFrom(vmName, username, password, sourcePath, destPath string) error {
+	_, err := Run("guestcontrol", vmName, "copyfrom", sourcePath, destPath, "--username", username, "--password", password)
+	return err
+}
+
+// IsGuestAdditionsReady verifica si las Guest Additions están listas para ejecutar comandos
+func IsGuestAdditionsReady(vmName, username, password string) bool {
+	// Intentar ejecutar un comando simple para verificar si las Guest Additions responden
+	_, err := Run(
+		"guestcontrol", vmName, "run",
+		"--username", username,
+		"--password", password,
+		"--exe", "/bin/echo",
+		"--wait-stdout", "--wait-stderr",
+		"--", "ok",
+	)
+	return err == nil
+}
+
+// WaitForGuestAdditions espera a que las Guest Additions estén listas
+func WaitForGuestAdditions(vmName, username, password string, maxRetries int, retryDelay time.Duration) error {
+	log := logger.Get()
+	log.Info("Esperando a que Guest Additions estén listas (máximo %d intentos de %v)...", maxRetries, retryDelay)
+
+	for i := 0; i < maxRetries; i++ {
+		if IsGuestAdditionsReady(vmName, username, password) {
+			log.Info("Guest Additions listas (intento %d/%d)", i+1, maxRetries)
+			return nil
+		}
+
+		if i < maxRetries-1 {
+			log.Debug("Intento %d/%d: Guest Additions no listas aún, esperando %v...", i+1, maxRetries, retryDelay)
+			time.Sleep(retryDelay)
+		}
+	}
+
+	return fmt.Errorf("Guest Additions no están listas después de %d intentos", maxRetries)
+}
+
+func GuestRunBash(vmName, username, password, script string) error {
+	log := logger.Get()
+
+	// Método 1: Intentar ejecutar directamente con bash -c
+	_, err := Run(
+		"guestcontrol", vmName, "run",
+		"--username", username,
+		"--password", password,
+		"--exe", "/bin/bash",
+		"--wait-stdout", "--wait-stderr",
+		"--", "-c", script,
+	)
+
+	if err == nil {
+		return nil
+	}
+
+	log.Debug("Método 1 (bash -c) falló: %v, intentando método 2...", err)
+
+	// Método 2: Intentar con sh en lugar de bash
+	_, err2 := Run(
+		"guestcontrol", vmName, "run",
+		"--username", username,
+		"--password", password,
+		"--exe", "/bin/sh",
+		"--wait-stdout", "--wait-stderr",
+		"--", "-c", script,
+	)
+
+	if err2 == nil {
+		return nil
+	}
+
+	log.Debug("Método 2 (sh -c) falló: %v", err2)
+
+	// Retornar el error original
 	return err
 }

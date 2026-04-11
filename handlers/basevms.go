@@ -18,6 +18,8 @@ type BaseVM struct {
 	DiskPath      string `json:"diskPath"`
 	DiskUUID      string `json:"diskUUID"`
 	DiskConverted bool   `json:"diskConverted"`
+	GuestUsername string `json:"guestUsername,omitempty"` // Usuario del sistema guest (ej: mary, root)
+	GuestPassword string `json:"guestPassword,omitempty"` // Password del usuario guest
 }
 
 func AddBaseVM(w http.ResponseWriter, r *http.Request) {

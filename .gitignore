@@ -2,3 +2,8 @@
 state.json
 keys/
 *.log
+
+# Nuevas reglas para archivos pesados
+disks/
+*.vdi
+*.txt

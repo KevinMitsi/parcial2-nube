@@ -82,7 +82,7 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 		return
 	}
 
-	// Req 14: Validar que el disco es de tipo multiattach o immutable
+	// Req 14: Validar que el disco es usable para VMs hijas
 	stepStart := time.Now()
 	diskType, err := vboxmanage.GetDiskType(disk.Path)
 	if err != nil {
@@ -92,10 +92,10 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 	}
 
 	diskTypeLower := strings.ToLower(diskType)
-	if !strings.Contains(diskTypeLower, "multiattach") && !strings.Contains(diskTypeLower, "immutable") {
-		err := fmt.Errorf("el disco debe ser de tipo multiattach o immutable, actual: %s", diskType)
+	if !strings.Contains(diskTypeLower, "multiattach") && !strings.Contains(diskTypeLower, "immutable") && !strings.Contains(diskTypeLower, "normal") {
+		err := fmt.Errorf("el disco debe ser de tipo multiattach, immutable o normal compatible, actual: %s", diskType)
 		log.LogOperationError("CreateUserVM", "validate-disk-type", err)
-		http.Error(w, "El disco debe ser convertido a multiconexión o immutable primero", http.StatusBadRequest)
+		http.Error(w, "El disco no tiene un tipo compatible para crear VMs hijas", http.StatusBadRequest)
 		return
 	}
 	log.LogOperationStep("Validar tipo de disco", time.Since(stepStart))
@@ -187,6 +187,57 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 	}
 	log.LogOperationStep("Iniciar VM", time.Since(stepStart))
 
+	// Esperar a que la VM obtenga IP con ciclo inteligente
+	stepStart = time.Now()
+	var vmIP string
+	maxIPRetries := 60              // 60 intentos
+	ipRetryDelay := 5 * time.Second // 5 segundos entre intentos (total: 5 minutos máximo)
+
+	log.Info("Esperando a que la VM %s obtenga una IP (máximo %d intentos de %v)...", vmName, maxIPRetries, ipRetryDelay)
+
+	for i := 0; i < maxIPRetries; i++ {
+		vmIP, err = vboxmanage.GetVMIP(vmName)
+		if err == nil && vmIP != "" {
+			log.Info("VM obtuvo IP: %s (intento %d/%d)", vmIP, i+1, maxIPRetries)
+			break
+		}
+
+		if i < maxIPRetries-1 {
+			log.Debug("Intento %d/%d: IP no disponible aún, esperando %v...", i+1, maxIPRetries, ipRetryDelay)
+			time.Sleep(ipRetryDelay)
+		}
+	}
+
+	if vmIP == "" {
+		log.Warn("No se pudo obtener IP después de %d intentos (%v), continuando de todos modos...", maxIPRetries, time.Since(stepStart))
+	} else {
+		log.LogOperationStep("Obtener IP de VM", time.Since(stepStart))
+	}
+
+	// Bootstrap en VM hija: instalar llave root de la VM base para habilitar SSH por clave.
+	stepStart = time.Now()
+
+	// Reutilizar baseVM ya buscada anteriormente para obtener las credenciales guardadas
+	// (baseVM ya fue declarada arriba para obtener el adaptador de red)
+
+	// Usar credenciales guardadas de la VM base, o fallback a valores por defecto
+	bootstrapUser := "mary"
+	bootstrapPass := "mary"
+	if baseVM != nil && baseVM.GuestUsername != "" && baseVM.GuestPassword != "" {
+		bootstrapUser = baseVM.GuestUsername
+		bootstrapPass = baseVM.GuestPassword
+		log.Info("Usando credenciales guardadas de VM base: usuario=%s", bootstrapUser)
+	} else {
+		log.Warn("No se encontraron credenciales guardadas para VM base %s, usando valores por defecto (mary/mary)", disk.SourceVM)
+	}
+
+	if err := InstallRootPublicKeyInGuestWithRetries(vmName, disk.SourceVM, bootstrapUser, bootstrapPass, 40, 2*time.Second); err != nil {
+		log.LogOperationError("CreateUserVM", "bootstrap-root-key", err)
+		// No fallar aquí - la VM está creada, solo le falta la llave root
+		log.Warn("Bootstrap falló pero continuando: %v. Intenta instalar root keys manualmente.", err)
+	}
+	log.LogOperationStep("Bootstrap llave root en VM hija", time.Since(stepStart))
+
 	disk.Connected = true
 
 	state.UserVMs = append(state.UserVMs, UserVM{
@@ -255,11 +306,19 @@ func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
 
 	var req struct {
 		Username string `json:"username"`
+		Password string `json:"password"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.LogOperationError("CreateUser", "decode-request", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Password == "" {
+		err := fmt.Errorf("password es requerido")
+		log.LogOperationError("CreateUser", "validate-password", err)
+		http.Error(w, "Debes proporcionar una contraseña para el usuario", http.StatusBadRequest)
 		return
 	}
 
@@ -327,17 +386,40 @@ func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
 	// Req 9: Generar llaves RSA 1024 para el usuario
 	stepStart = time.Now()
 	keyDir := filepath.Join("keys", vmName, req.Username)
-	os.MkdirAll(keyDir, 0755)
-
-	keyPath := filepath.Join(keyDir, "id_rsa")
-
-	cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("%s@%s", req.Username, vmName))
-	if err := cmd.Run(); err != nil {
-		log.LogOperationError("CreateUser", "generate-keys", err)
-		http.Error(w, fmt.Sprintf("Error generando llaves: %v", err), http.StatusInternalServerError)
+	if err := os.MkdirAll(keyDir, 0755); err != nil {
+		log.LogOperationError("CreateUser", "create-key-dir", err)
+		http.Error(w, fmt.Sprintf("Error creando directorio de llaves: %v", err), http.StatusInternalServerError)
 		return
 	}
-	log.LogOperationStep("Generar llaves SSH", time.Since(stepStart))
+
+	keyPath := filepath.Join(keyDir, "id_rsa")
+	pubKeyPath := keyPath + ".pub"
+
+	// Si las llaves ya existen de un intento previo, reutilizarlas.
+	if _, errPriv := os.Stat(keyPath); errPriv == nil {
+		if _, errPub := os.Stat(pubKeyPath); errPub == nil {
+			log.Info("Llaves de usuario ya existentes en: %s", keyDir)
+			log.LogOperationStep("Reutilizar llaves SSH existentes", time.Since(stepStart))
+		} else {
+			cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("%s@%s", req.Username, vmName))
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				log.LogOperationError("CreateUser", "generate-keys", err)
+				http.Error(w, fmt.Sprintf("Error generando llaves: %v | output: %s", err, string(out)), http.StatusInternalServerError)
+				return
+			}
+			log.LogOperationStep("Generar llaves SSH", time.Since(stepStart))
+		}
+	} else {
+		cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("%s@%s", req.Username, vmName))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			log.LogOperationError("CreateUser", "generate-keys", err)
+			http.Error(w, fmt.Sprintf("Error generando llaves: %v | output: %s", err, string(out)), http.StatusInternalServerError)
+			return
+		}
+		log.LogOperationStep("Generar llaves SSH", time.Since(stepStart))
+	}
 
 	// Leer llave pública
 	pubKeyData, _ := os.ReadFile(keyPath + ".pub")
@@ -348,7 +430,7 @@ func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
 
 	// Req 9: Crear usuario en la VM con SSH
 	stepStart = time.Now()
-	if err := CreateUserInVM(ip, rootKeyPath, req.Username, pubKey); err != nil {
+	if err := CreateUserInVM(ip, rootKeyPath, req.Username, req.Password, pubKey); err != nil {
 		log.LogOperationError("CreateUser", "create-user-in-vm", err)
 		http.Error(w, fmt.Sprintf("Error creando usuario en VM: %v", err), http.StatusInternalServerError)
 		return
@@ -410,6 +492,22 @@ func DownloadUserKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 	pubData, _ := os.ReadFile(publicKey)
 	pubFile, _ := zipWriter.Create("id_rsa.pub")
 	pubFile.Write(pubData)
+
+	instructionsContent := fmt.Sprintf("=== Instrucciones de acceso SSH ===\n\nUsuario: %s\nVM: %s\nIP: %s\n\nPasos para probar la llave en Windows (PowerShell):\n\n1. Extrae este ZIP en una carpeta, por ejemplo:\n   C:\\Users\\Mary\\Downloads\\%s_%s_keys\n\n2. Abre PowerShell dentro de ESA carpeta (donde están id_rsa e id_rsa.pub).\n\n3. Verifica que el archivo privado exista:\n   dir .\\id_rsa\n\n4. Conéctate por SSH usando la llave:\n   ssh -o StrictHostKeyChecking=accept-new -i .\\id_rsa %s@%s\n\n5. Si te pide password, la llave no se usó. Ejecuta modo verbose para diagnóstico:\n   ssh -vvv -i .\\id_rsa %s@%s\n\nResultado esperado:\n- Debe abrir sesión sin pedir password y ver un prompt como: %s@...:~$\n\nComandos útiles una vez dentro de la VM por SSH:\n- whoami                     (debe mostrar %s)\n- hostname -I                (muestra IP asignada)\n- pwd                        (directorio actual)\n- ls -la ~/.ssh              (valida que existe .ssh del usuario)\n- cat ~/.ssh/authorized_keys (verifica llave pública instalada)\n- exit                       (cerrar sesión SSH)",
+		userVM.Username,
+		userVM.Name,
+		userVM.IP,
+		userVM.Name,
+		userVM.Username,
+		userVM.Username,
+		userVM.IP,
+		userVM.Username,
+		userVM.IP,
+		userVM.Username,
+		userVM.Username,
+	)
+	instructionsFile, _ := zipWriter.Create("instrucciones.txt")
+	instructionsFile.Write([]byte(instructionsContent))
 
 	zipWriter.Close()
 
