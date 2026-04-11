@@ -187,15 +187,50 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 	}
 	log.LogOperationStep("Iniciar VM", time.Since(stepStart))
 
-	// Esperar a que la VM termine de bootear completamente
-	// Esto es crítico para que guestcontrol pueda conectarse después
-	log.Info("Esperando 5 minutos para que la VM %s termine completamente de bootear...", vmName)
-	time.Sleep(5 * time.Minute)
+	// Esperar a que la VM obtenga IP con ciclo inteligente
+	stepStart = time.Now()
+	var vmIP string
+	maxIPRetries := 60              // 60 intentos
+	ipRetryDelay := 5 * time.Second // 5 segundos entre intentos (total: 5 minutos máximo)
+
+	log.Info("Esperando a que la VM %s obtenga una IP (máximo %d intentos de %v)...", vmName, maxIPRetries, ipRetryDelay)
+
+	for i := 0; i < maxIPRetries; i++ {
+		vmIP, err = vboxmanage.GetVMIP(vmName)
+		if err == nil && vmIP != "" {
+			log.Info("VM obtuvo IP: %s (intento %d/%d)", vmIP, i+1, maxIPRetries)
+			break
+		}
+
+		if i < maxIPRetries-1 {
+			log.Debug("Intento %d/%d: IP no disponible aún, esperando %v...", i+1, maxIPRetries, ipRetryDelay)
+			time.Sleep(ipRetryDelay)
+		}
+	}
+
+	if vmIP == "" {
+		log.Warn("No se pudo obtener IP después de %d intentos (%v), continuando de todos modos...", maxIPRetries, time.Since(stepStart))
+	} else {
+		log.LogOperationStep("Obtener IP de VM", time.Since(stepStart))
+	}
 
 	// Bootstrap en VM hija: instalar llave root de la VM base para habilitar SSH por clave.
 	stepStart = time.Now()
+
+	// Reutilizar baseVM ya buscada anteriormente para obtener las credenciales guardadas
+	// (baseVM ya fue declarada arriba para obtener el adaptador de red)
+
+	// Usar credenciales guardadas de la VM base, o fallback a valores por defecto
 	bootstrapUser := "mary"
 	bootstrapPass := "mary"
+	if baseVM != nil && baseVM.GuestUsername != "" && baseVM.GuestPassword != "" {
+		bootstrapUser = baseVM.GuestUsername
+		bootstrapPass = baseVM.GuestPassword
+		log.Info("Usando credenciales guardadas de VM base: usuario=%s", bootstrapUser)
+	} else {
+		log.Warn("No se encontraron credenciales guardadas para VM base %s, usando valores por defecto (mary/mary)", disk.SourceVM)
+	}
+
 	if err := InstallRootPublicKeyInGuestWithRetries(vmName, disk.SourceVM, bootstrapUser, bootstrapPass, 40, 2*time.Second); err != nil {
 		log.LogOperationError("CreateUserVM", "bootstrap-root-key", err)
 		// No fallar aquí - la VM está creada, solo le falta la llave root
@@ -271,11 +306,19 @@ func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
 
 	var req struct {
 		Username string `json:"username"`
+		Password string `json:"password"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.LogOperationError("CreateUser", "decode-request", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Password == "" {
+		err := fmt.Errorf("password es requerido")
+		log.LogOperationError("CreateUser", "validate-password", err)
+		http.Error(w, "Debes proporcionar una contraseña para el usuario", http.StatusBadRequest)
 		return
 	}
 
@@ -387,7 +430,7 @@ func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
 
 	// Req 9: Crear usuario en la VM con SSH
 	stepStart = time.Now()
-	if err := CreateUserInVM(ip, rootKeyPath, req.Username, pubKey); err != nil {
+	if err := CreateUserInVM(ip, rootKeyPath, req.Username, req.Password, pubKey); err != nil {
 		log.LogOperationError("CreateUser", "create-user-in-vm", err)
 		http.Error(w, fmt.Sprintf("Error creando usuario en VM: %v", err), http.StatusInternalServerError)
 		return

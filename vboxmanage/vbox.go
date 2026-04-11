@@ -287,13 +287,46 @@ func GuestCopyTo(vmName, username, password, sourcePath, destPath string) error 
 	return err
 }
 
+func GuestCopyFrom(vmName, username, password, sourcePath, destPath string) error {
+	_, err := Run("guestcontrol", vmName, "copyfrom", sourcePath, destPath, "--username", username, "--password", password)
+	return err
+}
+
 func GuestRunBash(vmName, username, password, script string) error {
+	log := logger.Get()
+
+	// Método 1: Intentar ejecutar directamente con bash -c
 	_, err := Run(
 		"guestcontrol", vmName, "run",
 		"--username", username,
 		"--password", password,
 		"--exe", "/bin/bash",
-		"--", "-lc", script,
+		"--wait-stdout", "--wait-stderr",
+		"--", "-c", script,
 	)
+
+	if err == nil {
+		return nil
+	}
+
+	log.Debug("Método 1 (bash -c) falló: %v, intentando método 2...", err)
+
+	// Método 2: Intentar con sh en lugar de bash
+	_, err2 := Run(
+		"guestcontrol", vmName, "run",
+		"--username", username,
+		"--password", password,
+		"--exe", "/bin/sh",
+		"--wait-stdout", "--wait-stderr",
+		"--", "-c", script,
+	)
+
+	if err2 == nil {
+		return nil
+	}
+
+	log.Debug("Método 2 (sh -c) falló: %v", err2)
+
+	// Retornar el error original
 	return err
 }

@@ -220,7 +220,9 @@
             
             for (const vm of state.userVMs) {
                 const usernameInput = document.getElementById(`username-${vm.name}`);
+                const passwordInput = document.getElementById(`userpassword-${vm.name}`);
                 if (usernameInput) savedValues[`username-${vm.name}`] = usernameInput.value;
+                if (passwordInput) savedValues[`password-${vm.name}`] = passwordInput.value;
             }
             
             container.innerHTML = '';
@@ -242,6 +244,7 @@
                     ${vm.diskUUID ? `<p><small>Disco UUID: ${vm.diskUUID}</small></p>` : ''}
                     <div class="form-inline">
                         <input type="text" id="username-${vm.name}" placeholder="Nombre de usuario" value="${savedValues[`username-${vm.name}`] || ''}">
+                        <input type="password" id="userpassword-${vm.name}" placeholder="Contraseña" value="${savedValues[`password-${vm.name}`] || ''}">
                         <button id="btn-createuser-${vm.name}" onclick="createUser('${vm.name}')">Crear usuario</button>
                     </div>
                     <button onclick="downloadUserKeys('${vm.name}')" ${downloadUserDisabled}>Descargar llaves de usuario</button>
@@ -376,12 +379,14 @@
         // ── Acciones Zona 3 ────────────────────────────────────
         async function createUser(vmName) {
             const username = document.getElementById(`username-${vmName}`).value;
+            const password = document.getElementById(`userpassword-${vmName}`).value;
             if (!username) { toast('Ingresa un nombre de usuario', 'error'); return; }
+            if (!password) { toast('Ingresa una contraseña para el usuario', 'error'); return; }
 
             const btn = document.getElementById(`btn-createuser-${vmName}`);
             setBtnLoading(btn, true);
             try {
-                await api(`/api/uservms/${vmName}/user`, 'POST', { username });
+                await api(`/api/uservms/${vmName}/user`, 'POST', { username, password });
                 toast(`Usuario "${username}" creado en "${vmName}"`, 'success');
                 await loadState();
             } catch (e) {

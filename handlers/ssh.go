@@ -21,6 +21,8 @@ func shQuote(s string) string {
 }
 
 func InstallRootPublicKeyInGuest(targetVMName, keyVMName, guestUsername, guestPassword string) error {
+	log := logger.Get()
+
 	if strings.TrimSpace(guestUsername) == "" || strings.TrimSpace(guestPassword) == "" {
 		return fmt.Errorf("credenciales guest inválidas")
 	}
@@ -35,11 +37,32 @@ func InstallRootPublicKeyInGuest(targetVMName, keyVMName, guestUsername, guestPa
 		return fmt.Errorf("no se encontró llave root pública para %s en %s: %v", keyVMName, pubKeyPathAbs, err)
 	}
 
+	// Leer el contenido de la llave pública
+	pubKeyData, err := os.ReadFile(pubKeyPathAbs)
+	if err != nil {
+		return fmt.Errorf("no se pudo leer llave pública: %v", err)
+	}
+	pubKeyContent := strings.TrimSpace(string(pubKeyData))
+
+	// Método 1: Intentar con VBoxManage guestcontrol (método original)
 	guestPubKeyPath := "/tmp/platform_root_id_rsa.pub"
 	if err := vboxmanage.GuestCopyTo(targetVMName, guestUsername, guestPassword, pubKeyPathAbs, guestPubKeyPath); err != nil {
-		return fmt.Errorf("no se pudo copiar llave root al guest: %v", err)
+		log.Debug("VBoxManage copyto falló: %v, intentando método alternativo...", err)
+
+		// Método 2: Crear el archivo directamente con el contenido usando echo
+		// Esto evita la necesidad de copiar archivos
+		createFileCmd := fmt.Sprintf("mkdir -p /tmp && echo '%s' > /tmp/platform_root_id_rsa.pub", pubKeyContent)
+		runCmdCreate := createFileCmd
+		if guestUsername != "root" {
+			runCmdCreate = fmt.Sprintf("printf %%s %s | sudo -S -p '' /bin/bash -lc %s", shQuote(guestPassword+"\n"), shQuote(createFileCmd))
+		}
+
+		if err := vboxmanage.GuestRunBash(targetVMName, guestUsername, guestPassword, runCmdCreate); err != nil {
+			return fmt.Errorf("no se pudo crear archivo de llave en guest: %v", err)
+		}
 	}
 
+	// Instalar la llave en authorized_keys
 	installCmd := "mkdir -p /root/.ssh && cat /tmp/platform_root_id_rsa.pub >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root/.ssh"
 	runCmd := installCmd
 	if guestUsername != "root" {
@@ -132,77 +155,146 @@ func CreateRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 		return
 	}
 
-	// Req 3: Crear directorio para llaves en keys/{vm_name}/root/
+	// Verificar si la VM está encendida
 	stepStart := time.Now()
-	keyDir := filepath.Join("keys", vmName, "root")
-	os.MkdirAll(keyDir, 0755)
-	log.LogOperationStep("Crear directorio de llaves", time.Since(stepStart))
-
-	keyPath := filepath.Join(keyDir, "id_rsa")
-	pubKeyPath := keyPath + ".pub"
-	pubKeyPathAbs := pubKeyPath
-	if absPath, absErr := filepath.Abs(pubKeyPath); absErr == nil {
-		pubKeyPathAbs = absPath
-	}
-
-	keysAlreadyExist := false
-	if _, errPriv := os.Stat(keyPath); errPriv == nil {
-		if _, errPub := os.Stat(pubKeyPath); errPub == nil {
-			keysAlreadyExist = true
-			log.Info("Llaves root ya existentes en: %s", keyDir)
-		}
-	}
-
-	if !keysAlreadyExist {
-		// Req 3: Generar llaves RSA 1024
-		stepStart = time.Now()
-		cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("root@%s", vmName))
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			log.LogOperationError("CreateRootKeys", "generate-keys", err)
-			http.Error(w, fmt.Sprintf("Error generando llaves: %v | output: %s", err, string(out)), http.StatusInternalServerError)
-			return
-		}
-		log.LogOperationStep("Generar llaves RSA 1024", time.Since(stepStart))
-		log.Info("Llaves generadas en: %s", keyDir)
-	} else {
-		log.LogOperationStep("Reutilizar llaves RSA 1024", time.Since(stepStart))
-	}
-
-	if _, err := os.Stat(pubKeyPathAbs); err != nil {
-		log.LogOperationError("CreateRootKeys", "validate-pubkey-path", err)
-		http.Error(w, fmt.Sprintf("No se encontró la llave pública en ruta esperada: %s", pubKeyPathAbs), http.StatusInternalServerError)
-		return
-	}
-
-	// Instalar llave pública root dentro de la VM padre.
-	stepStart = time.Now()
 	running, err := vboxmanage.IsVMRunning(vmName)
 	if err != nil {
 		log.LogOperationError("CreateRootKeys", "check-vm-running", err)
 		http.Error(w, fmt.Sprintf("Error verificando estado de VM base: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	// Si no está encendida, encenderla
 	if !running {
-		err := fmt.Errorf("la VM base no está encendida")
-		log.LogOperationError("CreateRootKeys", "vm-not-running", err)
-		http.Error(w, "Enciende la VM base antes de crear/instalar llaves root", http.StatusBadRequest)
+		log.Info("VM %s no está encendida, iniciándola...", vmName)
+		if err := vboxmanage.StartVM(vmName); err != nil {
+			log.LogOperationError("CreateRootKeys", "start-vm", err)
+			http.Error(w, fmt.Sprintf("Error iniciando VM: %v", err), http.StatusInternalServerError)
+			return
+		}
+		log.Info("VM iniciada, esperando a que obtenga IP...")
+	}
+	log.LogOperationStep("Verificar/iniciar VM", time.Since(stepStart))
+
+	// Esperar a que la VM obtenga IP con ciclo inteligente
+	stepStart = time.Now()
+	var vmIP string
+	maxRetries := 60              // 60 intentos
+	retryDelay := 5 * time.Second // 5 segundos entre intentos (total: 5 minutos máximo)
+
+	log.Info("Esperando a que la VM obtenga una IP (máximo %d intentos de %v)...", maxRetries, retryDelay)
+
+	for i := 0; i < maxRetries; i++ {
+		vmIP, err = vboxmanage.GetVMIP(vmName)
+		if err == nil && vmIP != "" {
+			log.Info("VM obtuvo IP: %s (intento %d/%d)", vmIP, i+1, maxRetries)
+			break
+		}
+
+		if i < maxRetries-1 {
+			log.Debug("Intento %d/%d: IP no disponible aún, esperando %v...", i+1, maxRetries, retryDelay)
+			time.Sleep(retryDelay)
+		}
+	}
+
+	if vmIP == "" {
+		err := fmt.Errorf("no se pudo obtener IP después de %d intentos (%v)", maxRetries, time.Since(stepStart))
+		log.LogOperationError("CreateRootKeys", "get-vm-ip", err)
+		http.Error(w, "No se pudo obtener IP de la VM. Asegúrate de que la VM tenga VirtualBox Guest Additions instalado y que la red esté configurada correctamente.", http.StatusBadRequest)
+		return
+	}
+	log.LogOperationStep("Obtener IP de VM", time.Since(stepStart))
+
+	// Crear directorio para llaves en el host
+	stepStart = time.Now()
+	keyDir := filepath.Join("keys", vmName, "root")
+	os.MkdirAll(keyDir, 0755)
+	log.LogOperationStep("Crear directorio de llaves en host", time.Since(stepStart))
+
+	keyPath := filepath.Join(keyDir, "id_rsa")
+	pubKeyPath := keyPath + ".pub"
+
+	keysAlreadyExist := false
+	if _, errPriv := os.Stat(keyPath); errPriv == nil {
+		if _, errPub := os.Stat(pubKeyPath); errPub == nil {
+			keysAlreadyExist = true
+			log.Info("Llaves root ya existentes en host: %s", keyDir)
+		}
+	}
+
+	if !keysAlreadyExist {
+		// NUEVO ENFOQUE: Generar llaves SSH en Windows y luego copiarlas a la VM
+		stepStart = time.Now()
+		log.Info("Generando llaves SSH en Windows...")
+
+		// Generar llaves SSH en Windows usando ssh-keygen
+		keyPathAbs, _ := filepath.Abs(keyPath)
+		cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPathAbs, "-N", "", "-C", fmt.Sprintf("root@%s", vmName))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			log.LogOperationError("CreateRootKeys", "generate-keys-windows", err)
+			http.Error(w, fmt.Sprintf("Error generando llaves SSH en Windows: %v | output: %s", err, string(out)), http.StatusInternalServerError)
+			return
+		}
+		log.Info("Llaves SSH generadas en Windows: %s", keyDir)
+		log.LogOperationStep("Generar llaves SSH en Windows", time.Since(stepStart))
+
+		// Leer la llave pública generada
+		pubKeyData, err := os.ReadFile(pubKeyPath)
+		if err != nil {
+			log.LogOperationError("CreateRootKeys", "read-public-key", err)
+			http.Error(w, fmt.Sprintf("Error leyendo llave pública: %v", err), http.StatusInternalServerError)
+			return
+		}
+		pubKeyContent := strings.TrimSpace(string(pubKeyData))
+
+		// Instalar la llave pública en la VM
+		stepStart = time.Now()
+		log.Info("Instalando llave pública en VM...")
+
+		// Crear directorio .ssh y agregar llave a authorized_keys
+		installCmd := fmt.Sprintf("mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '%s' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root/.ssh", pubKeyContent)
+
+		var runCmd string
+		if guestUsername == "root" {
+			runCmd = installCmd
+		} else {
+			// Para usuarios no-root, usar sudo
+			runCmd = fmt.Sprintf("echo %s | sudo -S bash -c %s", shQuote(guestPassword), shQuote(installCmd))
+		}
+
+		if err := vboxmanage.GuestRunBash(vmName, guestUsername, guestPassword, runCmd); err != nil {
+			log.Error("Error instalando llave en VM: %v", err)
+			log.LogOperationError("CreateRootKeys", "install-key-in-vm", err)
+			http.Error(w, fmt.Sprintf("Error instalando llave en VM: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		log.LogOperationStep("Instalar llave pública en VM", time.Since(stepStart))
+		log.Info("Llaves generadas en Windows e instaladas en VM: %s", keyDir)
+	} else {
+		log.LogOperationStep("Reutilizar llaves existentes", time.Since(stepStart))
+	}
+
+	// Verificar que las llaves existen en el host
+	if _, err := os.Stat(keyPath); err != nil {
+		log.LogOperationError("CreateRootKeys", "validate-private-key", err)
+		http.Error(w, fmt.Sprintf("No se encontró la llave privada en: %s", keyPath), http.StatusInternalServerError)
+		return
+	}
+	if _, err := os.Stat(pubKeyPath); err != nil {
+		log.LogOperationError("CreateRootKeys", "validate-public-key", err)
+		http.Error(w, fmt.Sprintf("No se encontró la llave pública en: %s", pubKeyPath), http.StatusInternalServerError)
 		return
 	}
 
-	if err := InstallRootPublicKeyInGuest(vmName, vmName, guestUsername, guestPassword); err != nil {
-		log.LogOperationError("CreateRootKeys", "install-root-pubkey", err)
-		http.Error(w, fmt.Sprintf("No se pudo instalar la llave root en la VM base. Si usas un usuario no-root, debe tener sudo configurado: %v", err), http.StatusBadRequest)
-		return
-	}
-	log.LogOperationStep("Instalar llave root en VM base", time.Since(stepStart))
-
-	// Req 3: Actualizar estado hasRootKeys
+	// Req 3: Actualizar estado hasRootKeys y guardar credenciales
 	baseVM.HasRootKeys = true
+	baseVM.GuestUsername = guestUsername
+	baseVM.GuestPassword = guestPassword
 	saveStateFn()
 
 	log.LogOperationComplete("CreateRootKeys", time.Since(start),
-		fmt.Sprintf("VM: %s, Path: %s", vmName, keyDir))
+		fmt.Sprintf("VM: %s, Path: %s, IP: %s", vmName, keyDir, vmIP))
 	log.SetOperationID("")
 
 	status := "ok"
@@ -212,7 +304,7 @@ func CreateRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 		httpStatus = http.StatusOK
 	}
 	w.WriteHeader(httpStatus)
-	json.NewEncoder(w).Encode(map[string]string{"status": status})
+	json.NewEncoder(w).Encode(map[string]string{"status": status, "ip": vmIP})
 }
 
 func DownloadRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
@@ -327,7 +419,7 @@ func WaitForSSH(vmIP, keyPath string, maxRetries int) error {
 }
 
 // Req 9: Crear usuario en VM con SSH
-func CreateUserInVM(vmIP, rootKeyPath, username, userPubKey string) error {
+func CreateUserInVM(vmIP, rootKeyPath, username, password, userPubKey string) error {
 	log := logger.Get()
 	log.Info("Creando usuario '%s' en VM (IP: %s)", username, vmIP)
 
@@ -336,10 +428,11 @@ func CreateUserInVM(vmIP, rootKeyPath, username, userPubKey string) error {
 		return err
 	}
 
-	// Req 9: Crear usuario con directorio home y shell bash
+	// Req 9: Crear usuario con directorio home, shell bash y contraseña
 	stepStart := time.Now()
-	createUserCmd := fmt.Sprintf("useradd -m -s /bin/bash %s && mkdir -p /home/%s/.ssh && chmod 700 /home/%s/.ssh && chown %s:%s /home/%s/.ssh",
-		username, username, username, username, username, username)
+	// Usar chpasswd para establecer la contraseña de forma no interactiva
+	createUserCmd := fmt.Sprintf("useradd -m -s /bin/bash %s && echo '%s:%s' | chpasswd && mkdir -p /home/%s/.ssh && chmod 700 /home/%s/.ssh && chown %s:%s /home/%s/.ssh",
+		username, username, password, username, username, username, username, username)
 
 	cmd := exec.Command("ssh", "-i", rootKeyPath,
 		"-o", "StrictHostKeyChecking=no",
@@ -352,7 +445,7 @@ func CreateUserInVM(vmIP, rootKeyPath, username, userPubKey string) error {
 		log.Error("Error creando usuario: %v", err)
 		return fmt.Errorf("error creando usuario: %v | output: %s", err, string(out))
 	}
-	log.Info("Usuario creado en %v", time.Since(stepStart))
+	log.Info("Usuario creado con contraseña en %v", time.Since(stepStart))
 
 	// Req 9: Instalar llave pública en authorized_keys con permisos 600
 	stepStart = time.Now()
@@ -372,6 +465,6 @@ func CreateUserInVM(vmIP, rootKeyPath, username, userPubKey string) error {
 	}
 	log.Info("Llave pública instalada en %v", time.Since(stepStart))
 
-	log.Info("Usuario '%s' creado exitosamente con acceso SSH", username)
+	log.Info("Usuario '%s' creado exitosamente con contraseña y acceso SSH", username)
 	return nil
 }
