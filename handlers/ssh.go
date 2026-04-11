@@ -176,6 +176,31 @@ func CreateRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 	}
 	log.LogOperationStep("Verificar/iniciar VM", time.Since(stepStart))
 
+	// Esperar a que VirtualBox reporte la VM como completamente encendida
+	stepStart = time.Now()
+	log.Info("Esperando a que la VM termine de iniciar...")
+	vmRunning := false
+	for i := 0; i < 60; i++ {
+		vmRunning, err = vboxmanage.IsVMRunning(vmName)
+		if err == nil && vmRunning {
+			log.Info("VM lista para continuar (intento %d/60)", i+1)
+			break
+		}
+
+		if i < 59 {
+			log.Debug("Intento %d/60: VM aún iniciando, esperando 2s...", i+1)
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	if !vmRunning {
+		err := fmt.Errorf("la VM no alcanzó estado running después de esperar su arranque")
+		log.LogOperationError("CreateRootKeys", "wait-vm-running", err)
+		http.Error(w, "La VM no terminó de iniciar a tiempo", http.StatusBadRequest)
+		return
+	}
+	log.LogOperationStep("Esperar VM completamente encendida", time.Since(stepStart))
+
 	// Esperar a que la VM obtenga IP con ciclo inteligente
 	stepStart = time.Now()
 	var vmIP string
