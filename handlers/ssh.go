@@ -47,13 +47,32 @@ func CreateRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 	log.LogOperationStep("Crear directorio de llaves", time.Since(stepStart))
 
 	keyPath := filepath.Join(keyDir, "id_rsa")
+	pubKeyPath := keyPath + ".pub"
+
+	// Si las llaves ya existen, tratar la operación como idempotente.
+	if _, errPriv := os.Stat(keyPath); errPriv == nil {
+		if _, errPub := os.Stat(pubKeyPath); errPub == nil {
+			baseVM.HasRootKeys = true
+			saveStateFn()
+
+			log.Info("Llaves root ya existentes en: %s", keyDir)
+			log.LogOperationComplete("CreateRootKeys", time.Since(start),
+				fmt.Sprintf("VM: %s, Path: %s, Status: already_exists", vmName, keyDir))
+			log.SetOperationID("")
+
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "already_exists"})
+			return
+		}
+	}
 
 	// Req 3: Generar llaves RSA 1024
 	stepStart = time.Now()
 	cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("root@%s", vmName))
-	if err := cmd.Run(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		log.LogOperationError("CreateRootKeys", "generate-keys", err)
-		http.Error(w, fmt.Sprintf("Error generando llaves: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Error generando llaves: %v | output: %s", err, string(out)), http.StatusInternalServerError)
 		return
 	}
 	log.LogOperationStep("Generar llaves RSA 1024", time.Since(stepStart))

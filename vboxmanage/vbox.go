@@ -124,8 +124,57 @@ func GetDiskType(diskPath string) (string, error) {
 	return "", fmt.Errorf("no se pudo determinar el tipo de disco")
 }
 
+func getDiskInfo(diskRef string) (map[string]string, error) {
+	output, err := Run("showmediuminfo", "disk", diskRef)
+	if err != nil {
+		return nil, err
+	}
+
+	info := make(map[string]string)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, ":") {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		info[key] = value
+	}
+
+	return info, nil
+}
+
+func ResolveBaseDiskPath(diskRef string) (string, error) {
+	visited := make(map[string]bool)
+	current := diskRef
+
+	for {
+		info, err := getDiskInfo(current)
+		if err != nil {
+			return "", err
+		}
+
+		location := info["Location"]
+		if location == "" {
+			location = current
+		}
+
+		parentUUID := strings.ToLower(strings.TrimSpace(info["Parent UUID"]))
+		if parentUUID == "" || parentUUID == "base" || parentUUID == "none" || parentUUID == "null" {
+			return location, nil
+		}
+
+		if visited[parentUUID] {
+			return "", fmt.Errorf("cadena de discos con ciclo detectado en Parent UUID: %s", parentUUID)
+		}
+		visited[parentUUID] = true
+		current = parentUUID
+	}
+}
+
 func ConvertDiskToMultiAttach(diskPath string) error {
-	_, err := Run("modifymedium", "disk", diskPath, "--type", "immutable")
+	_, err := Run("modifymedium", "disk", diskPath, "--type", "multiattach")
 	return err
 }
 
@@ -177,13 +226,19 @@ func GetVMIP(vmName string) (string, error) {
 }
 
 func CloneDisk(source, dest string) error {
-	_, err := Run("clonemedium", "disk", source, dest, "--variant", "MultiAttach")
+	_, err := Run("clonemedium", "disk", source, dest, "--format", "VDI")
 	return err
 }
 
 func AttachDiskByUUID(vmName, ctrlName, diskUUID string) error {
-	_, err := Run("storageattach", vmName, "--storagectl", ctrlName, "--port", "0", "--device", "0", "--type", "hdd", "--medium", diskUUID)
-	return err
+	_, err := Run("storageattach", vmName, "--storagectl", ctrlName, "--port", "0", "--device", "0", "--type", "hdd", "--medium", diskUUID, "--mtype", "multiattach")
+	if err == nil {
+		return nil
+	}
+
+	logger.Get().Warn("No se pudo adjuntar con --mtype multiattach, reintentando adjunto estándar: %v", err)
+	_, fallbackErr := Run("storageattach", vmName, "--storagectl", ctrlName, "--port", "0", "--device", "0", "--type", "hdd", "--medium", diskUUID)
+	return fallbackErr
 }
 
 func CreateVM(name, ostype string) error {

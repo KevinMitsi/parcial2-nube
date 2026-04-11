@@ -82,7 +82,7 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 		return
 	}
 
-	// Req 14: Validar que el disco es de tipo multiattach o immutable
+	// Req 14: Validar que el disco es usable para VMs hijas
 	stepStart := time.Now()
 	diskType, err := vboxmanage.GetDiskType(disk.Path)
 	if err != nil {
@@ -92,10 +92,10 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 	}
 
 	diskTypeLower := strings.ToLower(diskType)
-	if !strings.Contains(diskTypeLower, "multiattach") && !strings.Contains(diskTypeLower, "immutable") {
-		err := fmt.Errorf("el disco debe ser de tipo multiattach o immutable, actual: %s", diskType)
+	if !strings.Contains(diskTypeLower, "multiattach") && !strings.Contains(diskTypeLower, "immutable") && !strings.Contains(diskTypeLower, "normal") {
+		err := fmt.Errorf("el disco debe ser de tipo multiattach, immutable o normal compatible, actual: %s", diskType)
 		log.LogOperationError("CreateUserVM", "validate-disk-type", err)
-		http.Error(w, "El disco debe ser convertido a multiconexión o immutable primero", http.StatusBadRequest)
+		http.Error(w, "El disco no tiene un tipo compatible para crear VMs hijas", http.StatusBadRequest)
 		return
 	}
 	log.LogOperationStep("Validar tipo de disco", time.Since(stepStart))

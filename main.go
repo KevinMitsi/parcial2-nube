@@ -137,10 +137,31 @@ func loadState() {
 		return
 	}
 
-	if err := json.Unmarshal(data, appState); err != nil {
+	type persistedState struct {
+		BaseVMs        []handlers.BaseVM `json:"baseVMs"`
+		Disks          []handlers.Disk   `json:"disks"`
+		UserVMs        []handlers.UserVM `json:"userVMs"`
+		BridgeAdapter  string            `json:"bridgeAdapter"`
+		NetworkAdapter string            `json:"networkAdapter"`
+	}
+
+	var persisted persistedState
+	if err := json.Unmarshal(data, &persisted); err != nil {
 		log.Error("Error deserializando state.json: %v", err)
 		log.Warn("Continuando con estado vacío")
 		return
+	}
+
+	appState.BaseVMs = persisted.BaseVMs
+	appState.Disks = persisted.Disks
+	appState.UserVMs = persisted.UserVMs
+
+	switch {
+	case persisted.BridgeAdapter != "":
+		appState.BridgeAdapter = persisted.BridgeAdapter
+	case persisted.NetworkAdapter != "":
+		appState.BridgeAdapter = persisted.NetworkAdapter
+		log.Info("Compatibilidad legacy aplicada: networkAdapter -> bridgeAdapter (%s)", appState.BridgeAdapter)
 	}
 
 	log.Info("Estado cargado exitosamente: %d VMs base, %d discos, %d VMs de usuario",
