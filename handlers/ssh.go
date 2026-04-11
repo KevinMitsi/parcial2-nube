@@ -5,13 +5,73 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 	"vbox-platform/logger"
+	"vbox-platform/vboxmanage"
 )
+
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func InstallRootPublicKeyInGuest(targetVMName, keyVMName, guestUsername, guestPassword string) error {
+	if strings.TrimSpace(guestUsername) == "" || strings.TrimSpace(guestPassword) == "" {
+		return fmt.Errorf("credenciales guest inválidas")
+	}
+
+	pubKeyPath := filepath.Join("keys", keyVMName, "root", "id_rsa.pub")
+	pubKeyPathAbs := pubKeyPath
+	if absPath, absErr := filepath.Abs(pubKeyPath); absErr == nil {
+		pubKeyPathAbs = absPath
+	}
+
+	if _, err := os.Stat(pubKeyPathAbs); err != nil {
+		return fmt.Errorf("no se encontró llave root pública para %s en %s: %v", keyVMName, pubKeyPathAbs, err)
+	}
+
+	guestPubKeyPath := "/tmp/platform_root_id_rsa.pub"
+	if err := vboxmanage.GuestCopyTo(targetVMName, guestUsername, guestPassword, pubKeyPathAbs, guestPubKeyPath); err != nil {
+		return fmt.Errorf("no se pudo copiar llave root al guest: %v", err)
+	}
+
+	installCmd := "mkdir -p /root/.ssh && cat /tmp/platform_root_id_rsa.pub >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown -R root:root /root/.ssh"
+	runCmd := installCmd
+	if guestUsername != "root" {
+		runCmd = fmt.Sprintf("printf %%s %s | sudo -S -p '' /bin/bash -lc %s", shQuote(guestPassword+"\n"), shQuote(installCmd))
+	}
+
+	if err := vboxmanage.GuestRunBash(targetVMName, guestUsername, guestPassword, runCmd); err != nil {
+		return fmt.Errorf("no se pudo instalar authorized_keys de root en guest: %v", err)
+	}
+
+	return nil
+}
+
+func InstallRootPublicKeyInGuestWithRetries(targetVMName, keyVMName, guestUsername, guestPassword string, maxRetries int, retryDelay time.Duration) error {
+	log := logger.Get()
+	var lastErr error
+
+	for i := 0; i < maxRetries; i++ {
+		if err := InstallRootPublicKeyInGuest(targetVMName, keyVMName, guestUsername, guestPassword); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			log.Warn("Intento %d/%d instalando llave root en %s falló: %v", i+1, maxRetries, targetVMName, err)
+		}
+
+		if i < maxRetries-1 {
+			time.Sleep(retryDelay)
+		}
+	}
+
+	return fmt.Errorf("no se pudo instalar llave root en guest después de %d intentos: %v", maxRetries, lastErr)
+}
 
 func CreateRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 	opID := fmt.Sprintf("create-rootkeys-%s-%d", vmName, time.Now().Unix())
@@ -20,6 +80,38 @@ func CreateRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 
 	start := time.Now()
 	log.LogOperation("CreateRootKeys", vmName, "system")
+
+	var req struct {
+		RootPassword  string `json:"rootPassword"`
+		GuestUsername string `json:"guestUsername"`
+		GuestPassword string `json:"guestPassword"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			log.LogOperationError("CreateRootKeys", "decode-request", err)
+			http.Error(w, "Body inválido", http.StatusBadRequest)
+			return
+		}
+	}
+	guestUsername := strings.TrimSpace(req.GuestUsername)
+	guestPassword := strings.TrimSpace(req.GuestPassword)
+
+	// Compatibilidad con clientes viejos que envían rootPassword.
+	if guestPassword == "" && strings.TrimSpace(req.RootPassword) != "" {
+		guestUsername = "root"
+		guestPassword = strings.TrimSpace(req.RootPassword)
+	}
+
+	if guestUsername == "" {
+		guestUsername = "root"
+	}
+
+	if guestPassword == "" {
+		err := fmt.Errorf("password de root no proporcionado")
+		log.LogOperationError("CreateRootKeys", "validate-guest-password", err)
+		http.Error(w, "Debes proporcionar credenciales del sistema invitado para instalar la llave en la VM base", http.StatusBadRequest)
+		return
+	}
 
 	state.Mu.Lock()
 	defer state.Mu.Unlock()
@@ -48,35 +140,62 @@ func CreateRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 
 	keyPath := filepath.Join(keyDir, "id_rsa")
 	pubKeyPath := keyPath + ".pub"
+	pubKeyPathAbs := pubKeyPath
+	if absPath, absErr := filepath.Abs(pubKeyPath); absErr == nil {
+		pubKeyPathAbs = absPath
+	}
 
-	// Si las llaves ya existen, tratar la operación como idempotente.
+	keysAlreadyExist := false
 	if _, errPriv := os.Stat(keyPath); errPriv == nil {
 		if _, errPub := os.Stat(pubKeyPath); errPub == nil {
-			baseVM.HasRootKeys = true
-			saveStateFn()
-
+			keysAlreadyExist = true
 			log.Info("Llaves root ya existentes en: %s", keyDir)
-			log.LogOperationComplete("CreateRootKeys", time.Since(start),
-				fmt.Sprintf("VM: %s, Path: %s, Status: already_exists", vmName, keyDir))
-			log.SetOperationID("")
-
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]string{"status": "already_exists"})
-			return
 		}
 	}
 
-	// Req 3: Generar llaves RSA 1024
-	stepStart = time.Now()
-	cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("root@%s", vmName))
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		log.LogOperationError("CreateRootKeys", "generate-keys", err)
-		http.Error(w, fmt.Sprintf("Error generando llaves: %v | output: %s", err, string(out)), http.StatusInternalServerError)
+	if !keysAlreadyExist {
+		// Req 3: Generar llaves RSA 1024
+		stepStart = time.Now()
+		cmd := exec.Command("ssh-keygen", "-t", "rsa", "-b", "1024", "-f", keyPath, "-N", "", "-C", fmt.Sprintf("root@%s", vmName))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			log.LogOperationError("CreateRootKeys", "generate-keys", err)
+			http.Error(w, fmt.Sprintf("Error generando llaves: %v | output: %s", err, string(out)), http.StatusInternalServerError)
+			return
+		}
+		log.LogOperationStep("Generar llaves RSA 1024", time.Since(stepStart))
+		log.Info("Llaves generadas en: %s", keyDir)
+	} else {
+		log.LogOperationStep("Reutilizar llaves RSA 1024", time.Since(stepStart))
+	}
+
+	if _, err := os.Stat(pubKeyPathAbs); err != nil {
+		log.LogOperationError("CreateRootKeys", "validate-pubkey-path", err)
+		http.Error(w, fmt.Sprintf("No se encontró la llave pública en ruta esperada: %s", pubKeyPathAbs), http.StatusInternalServerError)
 		return
 	}
-	log.LogOperationStep("Generar llaves RSA 1024", time.Since(stepStart))
-	log.Info("Llaves generadas en: %s", keyDir)
+
+	// Instalar llave pública root dentro de la VM padre.
+	stepStart = time.Now()
+	running, err := vboxmanage.IsVMRunning(vmName)
+	if err != nil {
+		log.LogOperationError("CreateRootKeys", "check-vm-running", err)
+		http.Error(w, fmt.Sprintf("Error verificando estado de VM base: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if !running {
+		err := fmt.Errorf("la VM base no está encendida")
+		log.LogOperationError("CreateRootKeys", "vm-not-running", err)
+		http.Error(w, "Enciende la VM base antes de crear/instalar llaves root", http.StatusBadRequest)
+		return
+	}
+
+	if err := InstallRootPublicKeyInGuest(vmName, vmName, guestUsername, guestPassword); err != nil {
+		log.LogOperationError("CreateRootKeys", "install-root-pubkey", err)
+		http.Error(w, fmt.Sprintf("No se pudo instalar la llave root en la VM base. Si usas un usuario no-root, debe tener sudo configurado: %v", err), http.StatusBadRequest)
+		return
+	}
+	log.LogOperationStep("Instalar llave root en VM base", time.Since(stepStart))
 
 	// Req 3: Actualizar estado hasRootKeys
 	baseVM.HasRootKeys = true
@@ -86,8 +205,14 @@ func CreateRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 		fmt.Sprintf("VM: %s, Path: %s", vmName, keyDir))
 	log.SetOperationID("")
 
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	status := "ok"
+	httpStatus := http.StatusCreated
+	if keysAlreadyExist {
+		status = "already_exists"
+		httpStatus = http.StatusOK
+	}
+	w.WriteHeader(httpStatus)
+	json.NewEncoder(w).Encode(map[string]string{"status": status})
 }
 
 func DownloadRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
@@ -160,17 +285,26 @@ func InstallRootKey(vmName, vmIP, rootPassword string) error {
 func WaitForSSH(vmIP, keyPath string, maxRetries int) error {
 	log := logger.Get()
 	log.Info("Esperando conexión SSH a %s (máximo %d intentos)", vmIP, maxRetries)
+	var lastErr error
 
 	for i := 0; i < maxRetries; i++ {
 		log.Debug("Intento SSH %d/%d", i+1, maxRetries)
 
-		// Req 15: Timeout de 3 segundos
-		cmd := exec.Command("ssh", "-i", keyPath, "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3", fmt.Sprintf("root@%s", vmIP), "echo ok")
-		if err := cmd.Run(); err == nil {
+		// Modo no interactivo: solo llave. Evita quedarse bloqueado pidiendo password.
+		cmd := exec.Command("ssh", "-i", keyPath,
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "ConnectTimeout=3",
+			"-o", "BatchMode=yes",
+			"-o", "PasswordAuthentication=no",
+			fmt.Sprintf("root@%s", vmIP), "echo ok")
+
+		out, err := cmd.CombinedOutput()
+		if err == nil {
 			log.Info("Conexión SSH establecida exitosamente")
 			return nil
 		} else {
-			log.Warn("Intento SSH %d falló: %v", i+1, err)
+			lastErr = fmt.Errorf("%v | output: %s", err, string(out))
+			log.Warn("Intento SSH %d falló: %v", i+1, lastErr)
 		}
 
 		// Req 15: Espera de 3 segundos entre intentos
@@ -180,6 +314,14 @@ func WaitForSSH(vmIP, keyPath string, maxRetries int) error {
 	}
 
 	err := fmt.Errorf("timeout esperando SSH después de %d intentos", maxRetries)
+	if lastErr != nil {
+		errText := strings.ToLower(lastErr.Error())
+		if strings.Contains(errText, "permission denied") || strings.Contains(errText, "password") || strings.Contains(errText, "publickey") {
+			err = fmt.Errorf("autenticación SSH con llave falló para root@%s. La VM no acepta la llave root generada por la plataforma. Debes configurar acceso root por clave en la VM base y deshabilitar login por password para este flujo. Detalle: %v", vmIP, lastErr)
+		} else {
+			err = fmt.Errorf("%v | último error: %v", err, lastErr)
+		}
+	}
 	log.Error("Error SSH: host=%s, keyPath=%s, error=%v", vmIP, keyPath, err)
 	return err
 }
@@ -199,12 +341,16 @@ func CreateUserInVM(vmIP, rootKeyPath, username, userPubKey string) error {
 	createUserCmd := fmt.Sprintf("useradd -m -s /bin/bash %s && mkdir -p /home/%s/.ssh && chmod 700 /home/%s/.ssh && chown %s:%s /home/%s/.ssh",
 		username, username, username, username, username, username)
 
-	cmd := exec.Command("ssh", "-i", rootKeyPath, "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3",
+	cmd := exec.Command("ssh", "-i", rootKeyPath,
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "ConnectTimeout=3",
+		"-o", "BatchMode=yes",
+		"-o", "PasswordAuthentication=no",
 		fmt.Sprintf("root@%s", vmIP), createUserCmd)
 
-	if err := cmd.Run(); err != nil {
+	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Error("Error creando usuario: %v", err)
-		return fmt.Errorf("error creando usuario: %v", err)
+		return fmt.Errorf("error creando usuario: %v | output: %s", err, string(out))
 	}
 	log.Info("Usuario creado en %v", time.Since(stepStart))
 
@@ -213,12 +359,16 @@ func CreateUserInVM(vmIP, rootKeyPath, username, userPubKey string) error {
 	installKeyCmd := fmt.Sprintf("echo '%s' >> /home/%s/.ssh/authorized_keys && chmod 600 /home/%s/.ssh/authorized_keys && chown %s:%s /home/%s/.ssh/authorized_keys",
 		userPubKey, username, username, username, username, username)
 
-	cmd = exec.Command("ssh", "-i", rootKeyPath, "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3",
+	cmd = exec.Command("ssh", "-i", rootKeyPath,
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "ConnectTimeout=3",
+		"-o", "BatchMode=yes",
+		"-o", "PasswordAuthentication=no",
 		fmt.Sprintf("root@%s", vmIP), installKeyCmd)
 
-	if err := cmd.Run(); err != nil {
+	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Error("Error instalando llave pública: %v", err)
-		return fmt.Errorf("error instalando llave: %v", err)
+		return fmt.Errorf("error instalando llave: %v | output: %s", err, string(out))
 	}
 	log.Info("Llave pública instalada en %v", time.Since(stepStart))
 

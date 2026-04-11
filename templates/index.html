@@ -273,10 +273,23 @@
 
         async function createRootKeys(vmName) {
             const btn = document.getElementById(`btn-rootkeys-${vmName}`);
+            const guestUsername = prompt(`Usuario dentro de la VM base "${vmName}" para instalar la llave (usa root o un usuario con sudo):`, 'root');
+            if (guestUsername === null) return;
+            if (!guestUsername.trim()) {
+                toast('Debes ingresar el usuario del guest para continuar', 'error');
+                return;
+            }
+
+            const guestPassword = prompt(`Password de "${guestUsername}" en la VM base "${vmName}":`);
+            if (guestPassword === null) return;
+            if (!guestPassword.trim()) {
+                toast('Debes ingresar el password del usuario guest para continuar', 'error');
+                return;
+            }
             setBtnLoading(btn, true);
             try {
-                await api(`/api/basevms/${vmName}/rootkeys`, 'POST');
-                toast(`Llaves de root creadas para "${vmName}"`, 'success');
+                await api(`/api/basevms/${vmName}/rootkeys`, 'POST', { guestUsername, guestPassword });
+                toast(`Llaves de root creadas e instaladas en "${vmName}"`, 'success');
                 await loadState();
             } catch (e) {
                 toast(`Error creando llaves: ${e.message}`, 'error');
