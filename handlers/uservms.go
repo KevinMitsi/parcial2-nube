@@ -187,6 +187,22 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 	}
 	log.LogOperationStep("Iniciar VM", time.Since(stepStart))
 
+	// Esperar a que la VM termine de bootear completamente
+	// Esto es crítico para que guestcontrol pueda conectarse después
+	log.Info("Esperando 5 minutos para que la VM %s termine completamente de bootear...", vmName)
+	time.Sleep(5 * time.Minute)
+
+	// Bootstrap en VM hija: instalar llave root de la VM base para habilitar SSH por clave.
+	stepStart = time.Now()
+	bootstrapUser := "mary"
+	bootstrapPass := "mary"
+	if err := InstallRootPublicKeyInGuestWithRetries(vmName, disk.SourceVM, bootstrapUser, bootstrapPass, 40, 2*time.Second); err != nil {
+		log.LogOperationError("CreateUserVM", "bootstrap-root-key", err)
+		// No fallar aquí - la VM está creada, solo le falta la llave root
+		log.Warn("Bootstrap falló pero continuando: %v. Intenta instalar root keys manualmente.", err)
+	}
+	log.LogOperationStep("Bootstrap llave root en VM hija", time.Since(stepStart))
+
 	disk.Connected = true
 
 	state.UserVMs = append(state.UserVMs, UserVM{
@@ -433,6 +449,22 @@ func DownloadUserKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 	pubData, _ := os.ReadFile(publicKey)
 	pubFile, _ := zipWriter.Create("id_rsa.pub")
 	pubFile.Write(pubData)
+
+	instructionsContent := fmt.Sprintf("=== Instrucciones de acceso SSH ===\n\nUsuario: %s\nVM: %s\nIP: %s\n\nPasos para probar la llave en Windows (PowerShell):\n\n1. Extrae este ZIP en una carpeta, por ejemplo:\n   C:\\Users\\Mary\\Downloads\\%s_%s_keys\n\n2. Abre PowerShell dentro de ESA carpeta (donde están id_rsa e id_rsa.pub).\n\n3. Verifica que el archivo privado exista:\n   dir .\\id_rsa\n\n4. Conéctate por SSH usando la llave:\n   ssh -o StrictHostKeyChecking=accept-new -i .\\id_rsa %s@%s\n\n5. Si te pide password, la llave no se usó. Ejecuta modo verbose para diagnóstico:\n   ssh -vvv -i .\\id_rsa %s@%s\n\nResultado esperado:\n- Debe abrir sesión sin pedir password y ver un prompt como: %s@...:~$\n\nComandos útiles una vez dentro de la VM por SSH:\n- whoami                     (debe mostrar %s)\n- hostname -I                (muestra IP asignada)\n- pwd                        (directorio actual)\n- ls -la ~/.ssh              (valida que existe .ssh del usuario)\n- cat ~/.ssh/authorized_keys (verifica llave pública instalada)\n- exit                       (cerrar sesión SSH)",
+		userVM.Username,
+		userVM.Name,
+		userVM.IP,
+		userVM.Name,
+		userVM.Username,
+		userVM.Username,
+		userVM.IP,
+		userVM.Username,
+		userVM.IP,
+		userVM.Username,
+		userVM.Username,
+	)
+	instructionsFile, _ := zipWriter.Create("instrucciones.txt")
+	instructionsFile.Write([]byte(instructionsContent))
 
 	zipWriter.Close()
 

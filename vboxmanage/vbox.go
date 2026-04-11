@@ -281,3 +281,19 @@ func DeleteDisk(diskPath string) error {
 	_, err := Run("closemedium", "disk", diskPath, "--delete")
 	return err
 }
+
+func GuestCopyTo(vmName, username, password, sourcePath, destPath string) error {
+	_, err := Run("guestcontrol", vmName, "copyto", sourcePath, destPath, "--username", username, "--password", password)
+	return err
+}
+
+func GuestRunBash(vmName, username, password, script string) error {
+	_, err := Run(
+		"guestcontrol", vmName, "run",
+		"--username", username,
+		"--password", password,
+		"--exe", "/bin/bash",
+		"--", "-lc", script,
+	)
+	return err
+}
