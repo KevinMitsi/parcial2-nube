@@ -292,6 +292,40 @@ func GuestCopyFrom(vmName, username, password, sourcePath, destPath string) erro
 	return err
 }
 
+// IsGuestAdditionsReady verifica si las Guest Additions están listas para ejecutar comandos
+func IsGuestAdditionsReady(vmName, username, password string) bool {
+	// Intentar ejecutar un comando simple para verificar si las Guest Additions responden
+	_, err := Run(
+		"guestcontrol", vmName, "run",
+		"--username", username,
+		"--password", password,
+		"--exe", "/bin/echo",
+		"--wait-stdout", "--wait-stderr",
+		"--", "ok",
+	)
+	return err == nil
+}
+
+// WaitForGuestAdditions espera a que las Guest Additions estén listas
+func WaitForGuestAdditions(vmName, username, password string, maxRetries int, retryDelay time.Duration) error {
+	log := logger.Get()
+	log.Info("Esperando a que Guest Additions estén listas (máximo %d intentos de %v)...", maxRetries, retryDelay)
+
+	for i := 0; i < maxRetries; i++ {
+		if IsGuestAdditionsReady(vmName, username, password) {
+			log.Info("Guest Additions listas (intento %d/%d)", i+1, maxRetries)
+			return nil
+		}
+
+		if i < maxRetries-1 {
+			log.Debug("Intento %d/%d: Guest Additions no listas aún, esperando %v...", i+1, maxRetries, retryDelay)
+			time.Sleep(retryDelay)
+		}
+	}
+
+	return fmt.Errorf("Guest Additions no están listas después de %d intentos", maxRetries)
+}
+
 func GuestRunBash(vmName, username, password, script string) error {
 	log := logger.Get()
 

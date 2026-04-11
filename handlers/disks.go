@@ -81,10 +81,38 @@ func CreateMultiAttachDisk(w http.ResponseWriter, r *http.Request, vmName string
 
 	vmState := strings.ToLower(info["VMState"])
 	if vmState != "poweroff" {
-		err := fmt.Errorf("estado actual de VM base: %s", vmState)
-		log.LogOperationError("CreateMultiAttachDisk", "validate-vm-poweroff", err)
-		http.Error(w, "La VM base debe estar completamente apagada (poweroff) para preparar su disco. Si está en estado saved/restoring/running, apágala desde VirtualBox e intenta de nuevo.", http.StatusBadRequest)
-		return
+		log.Info("VM %s está en estado '%s', apagándola antes de convertir disco...", vmName, vmState)
+
+		// Intentar apagar la VM
+		stepStart = time.Now()
+		if err := vboxmanage.PowerOffVM(vmName); err != nil {
+			log.LogOperationError("CreateMultiAttachDisk", "poweroff-vm", err)
+			http.Error(w, fmt.Sprintf("No se pudo apagar la VM automáticamente (estado: %s): %v. Apágala manualmente desde VirtualBox e intenta de nuevo.", vmState, err), http.StatusBadRequest)
+			return
+		}
+		log.LogOperationStep("Apagar VM antes de conversión", time.Since(stepStart))
+
+		// Esperar un momento para asegurar que la VM se apagó completamente
+		log.Info("Esperando a que la VM se apague completamente...")
+		time.Sleep(3 * time.Second)
+
+		// Verificar que efectivamente se apagó
+		stepStart = time.Now()
+		info, err = vboxmanage.GetVMInfo(vmName)
+		if err != nil {
+			log.LogOperationError("CreateMultiAttachDisk", "verify-vm-poweroff", err)
+			http.Error(w, fmt.Sprintf("Error verificando estado de VM después de apagar: %v", err), http.StatusInternalServerError)
+			return
+		}
+		vmState = strings.ToLower(info["VMState"])
+		if vmState != "poweroff" {
+			err := fmt.Errorf("VM no se apagó correctamente, estado actual: %s", vmState)
+			log.LogOperationError("CreateMultiAttachDisk", "validate-vm-poweroff-after", err)
+			http.Error(w, fmt.Sprintf("La VM no se apagó correctamente (estado: %s). Apágala manualmente desde VirtualBox e intenta de nuevo.", vmState), http.StatusBadRequest)
+			return
+		}
+		log.LogOperationStep("Verificar VM apagada", time.Since(stepStart))
+		log.Info("VM apagada exitosamente, continuando con conversión de disco...")
 	}
 
 	// Buscar el disco principal (SATA-0-0)

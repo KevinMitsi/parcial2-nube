@@ -205,6 +205,16 @@ func CreateRootKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 	}
 	log.LogOperationStep("Obtener IP de VM", time.Since(stepStart))
 
+	// Esperar a que Guest Additions estén listas
+	stepStart = time.Now()
+	log.Info("Esperando a que Guest Additions estén listas...")
+	if err := vboxmanage.WaitForGuestAdditions(vmName, guestUsername, guestPassword, 30, 5*time.Second); err != nil {
+		log.LogOperationError("CreateRootKeys", "wait-guest-additions", err)
+		http.Error(w, fmt.Sprintf("Guest Additions no están listas: %v. Asegúrate de que VirtualBox Guest Additions esté instalado y funcionando en la VM.", err), http.StatusBadRequest)
+		return
+	}
+	log.LogOperationStep("Esperar Guest Additions", time.Since(stepStart))
+
 	// Crear directorio para llaves en el host
 	stepStart = time.Now()
 	keyDir := filepath.Join("keys", vmName, "root")
