@@ -17,15 +17,21 @@ import (
 )
 
 type UserVM struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	SourceVM    string `json:"sourceVM"`
-	DiskPath    string `json:"diskPath"`
-	DiskUUID    string `json:"diskUUID"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	SourceVM    string   `json:"sourceVM"`
+	DiskPath    string   `json:"diskPath"`
+	DiskUUID    string   `json:"diskUUID"`
+	Username    string   `json:"username"`
+	HasUserKeys bool     `json:"hasUserKeys"`
+	Users       []VMUser `json:"users,omitempty"`
+	IP          string   `json:"ip"`
+	State       string   `json:"state"`
+}
+
+type VMUser struct {
 	Username    string `json:"username"`
 	HasUserKeys bool   `json:"hasUserKeys"`
-	IP          string `json:"ip"`
-	State       string `json:"state"`
 }
 
 type State struct {
@@ -42,6 +48,42 @@ var saveStateFn func()
 func InitHandlers(s *State, saveFn func()) {
 	state = s
 	saveStateFn = saveFn
+}
+
+func shutdownRunningUserVMsForDisk(diskUUID string) {
+	log := logger.Get()
+
+	for i := range state.UserVMs {
+		userVM := &state.UserVMs[i]
+		if userVM.DiskUUID != diskUUID || strings.ToLower(userVM.State) != "running" {
+			continue
+		}
+
+		log.Info("Apagando VM hija existente antes de crear una nueva: %s", userVM.Name)
+		if _, err := vboxmanage.Run("controlvm", userVM.Name, "acpipowerbutton"); err != nil {
+			log.Warn("No se pudo enviar apagado ACPI a %s: %v", userVM.Name, err)
+		}
+
+		stopped := false
+		for retry := 0; retry < 12; retry++ {
+			running, err := vboxmanage.IsVMRunning(userVM.Name)
+			if err == nil && !running {
+				stopped = true
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+
+		if !stopped {
+			log.Warn("La VM %s seguía encendida, forzando apagado", userVM.Name)
+			if err := vboxmanage.PowerOffVM(userVM.Name); err != nil {
+				log.Warn("No se pudo forzar apagado de %s: %v", userVM.Name, err)
+			}
+		}
+
+		userVM.State = "poweroff"
+		log.Info("VM hija detenida: %s", userVM.Name)
+	}
 }
 
 func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
@@ -119,6 +161,8 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 		return
 	}
 	log.LogOperationStep("Verificar VM no existe", time.Since(stepStart))
+
+	shutdownRunningUserVMsForDisk(disk.UUID)
 
 	// Req 8: Crear VM
 	stepStart = time.Now()
@@ -246,6 +290,7 @@ func CreateUserVM(w http.ResponseWriter, r *http.Request, diskName string) {
 		SourceVM:    disk.SourceVM,
 		DiskPath:    disk.Path,
 		DiskUUID:    disk.UUID,
+		Users:       []VMUser{},
 		State:       "running",
 	})
 
@@ -437,8 +482,24 @@ func CreateUser(w http.ResponseWriter, r *http.Request, vmName string) {
 	}
 	log.LogOperationStep("Crear usuario en VM", time.Since(stepStart))
 
+	legacyUsername := strings.TrimSpace(userVM.Username)
+	legacyHasKeys := userVM.HasUserKeys
+	if len(userVM.Users) == 0 && legacyUsername != "" {
+		userVM.Users = append(userVM.Users, VMUser{Username: legacyUsername, HasUserKeys: legacyHasKeys})
+	}
 	userVM.Username = req.Username
 	userVM.HasUserKeys = true
+	updated := false
+	for i := range userVM.Users {
+		if userVM.Users[i].Username == req.Username {
+			userVM.Users[i].HasUserKeys = true
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		userVM.Users = append(userVM.Users, VMUser{Username: req.Username, HasUserKeys: true})
+	}
 	saveStateFn()
 
 	log.LogOperationComplete("CreateUser", time.Since(start),
@@ -470,7 +531,33 @@ func DownloadUserKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 		return
 	}
 
-	keyDir := filepath.Join("keys", vmName, userVM.Username)
+	selectedUsername := strings.TrimSpace(r.URL.Query().Get("username"))
+	if selectedUsername == "" {
+		selectedUsername = userVM.Username
+	}
+
+	if selectedUsername == "" {
+		log.Error("No hay usuario seleccionado para VM: %s", vmName)
+		http.Error(w, "Usuario no encontrado", http.StatusNotFound)
+		return
+	}
+
+	if len(userVM.Users) > 0 {
+		found := false
+		for _, user := range userVM.Users {
+			if user.Username == selectedUsername {
+				found = true
+				break
+			}
+		}
+		if !found && r.URL.Query().Get("username") != "" {
+			log.Error("Usuario %s no encontrado para VM: %s", selectedUsername, vmName)
+			http.Error(w, "Usuario no encontrado", http.StatusNotFound)
+			return
+		}
+	}
+
+	keyDir := filepath.Join("keys", vmName, selectedUsername)
 	privateKey := filepath.Join(keyDir, "id_rsa")
 	publicKey := filepath.Join(keyDir, "id_rsa.pub")
 
@@ -494,17 +581,17 @@ func DownloadUserKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 	pubFile.Write(pubData)
 
 	instructionsContent := fmt.Sprintf("=== Instrucciones de acceso SSH ===\n\nUsuario: %s\nVM: %s\nIP: %s\n\nPasos para probar la llave en Windows (PowerShell):\n\n1. Extrae este ZIP en una carpeta, por ejemplo:\n   C:\\Users\\Mary\\Downloads\\%s_%s_keys\n\n2. Abre PowerShell dentro de ESA carpeta (donde están id_rsa e id_rsa.pub).\n\n3. Verifica que el archivo privado exista:\n   dir .\\id_rsa\n\n4. Conéctate por SSH usando la llave:\n   ssh -o StrictHostKeyChecking=accept-new -i .\\id_rsa %s@%s\n\n5. Si te pide password, la llave no se usó. Ejecuta modo verbose para diagnóstico:\n   ssh -vvv -i .\\id_rsa %s@%s\n\nResultado esperado:\n- Debe abrir sesión sin pedir password y ver un prompt como: %s@...:~$\n\nComandos útiles una vez dentro de la VM por SSH:\n- whoami                     (debe mostrar %s)\n- hostname -I                (muestra IP asignada)\n- pwd                        (directorio actual)\n- ls -la ~/.ssh              (valida que existe .ssh del usuario)\n- cat ~/.ssh/authorized_keys (verifica llave pública instalada)\n- exit                       (cerrar sesión SSH)",
-		userVM.Username,
+		selectedUsername,
 		userVM.Name,
 		userVM.IP,
 		userVM.Name,
-		userVM.Username,
-		userVM.Username,
+		selectedUsername,
+		selectedUsername,
 		userVM.IP,
-		userVM.Username,
+		selectedUsername,
 		userVM.IP,
-		userVM.Username,
-		userVM.Username,
+		selectedUsername,
+		selectedUsername,
 	)
 	instructionsFile, _ := zipWriter.Create("instrucciones.txt")
 	instructionsFile.Write([]byte(instructionsContent))
@@ -512,7 +599,7 @@ func DownloadUserKeys(w http.ResponseWriter, r *http.Request, vmName string) {
 	zipWriter.Close()
 
 	// Req 4: Enviar ZIP con nombre específico
-	zipName := fmt.Sprintf("%s_%s_keys.zip", vmName, userVM.Username)
+	zipName := fmt.Sprintf("%s_%s_keys.zip", vmName, selectedUsername)
 	log.Info("Enviando archivo: %s", zipName)
 
 	w.Header().Set("Content-Type", "application/zip")

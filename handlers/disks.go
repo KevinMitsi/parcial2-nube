@@ -126,6 +126,31 @@ func CreateMultiAttachDisk(w http.ResponseWriter, r *http.Request, vmName string
 
 	log.Info("Disco original encontrado: %s", originalDisk)
 
+	controllerName := strings.TrimSpace(info["storagecontrollername1"])
+	if controllerName == "" {
+		controllerName = "SATA"
+	}
+
+	stepStart = time.Now()
+	if err := vboxmanage.DetachDisk(vmName, controllerName); err != nil {
+		log.LogOperationError("CreateMultiAttachDisk", "detach-parent-disk", err)
+		http.Error(w, fmt.Sprintf("Error desconectando disco de la VM base antes de convertir: %v", err), http.StatusInternalServerError)
+		return
+	}
+	log.LogOperationStep("Desconectar disco de VM base", time.Since(stepStart))
+
+	reattachParentDisk := true
+	defer func() {
+		if !reattachParentDisk {
+			return
+		}
+		if err := vboxmanage.AttachDisk(vmName, controllerName, originalDisk); err != nil {
+			log.Error("No se pudo reconectar el disco original %s en la VM base %s: %v", originalDisk, vmName, err)
+			return
+		}
+		log.Info("Disco original reconectado en VM base: %s", originalDisk)
+	}()
+
 	// Verificar tipo de disco actual
 	stepStart = time.Now()
 	diskType, err := vboxmanage.GetDiskType(originalDisk)
@@ -189,6 +214,8 @@ func CreateMultiAttachDisk(w http.ResponseWriter, r *http.Request, vmName string
 		}
 		log.LogOperationStep("Convertir disco padre a multiattach", time.Since(stepStart))
 	}
+
+	reattachParentDisk = true
 
 	// Obtener UUID del disco padre (el que compartirán las VMs hijas)
 	stepStart = time.Now()

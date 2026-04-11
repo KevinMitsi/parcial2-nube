@@ -230,9 +230,19 @@
             for (const vm of state.userVMs) {
                 const card = document.createElement('div');
                 card.className = 'card';
-                
-                // Req 10: Habilitar descarga solo cuando hasUserKeys es true
-                const downloadUserDisabled = vm.hasUserKeys ? '' : 'disabled';
+
+                const users = Array.isArray(vm.users) && vm.users.length
+                    ? vm.users
+                    : (vm.username ? [{ username: vm.username, hasUserKeys: vm.hasUserKeys }] : []);
+
+                const usersHtml = users.length
+                    ? users.map(user => `
+                        <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap;">
+                            <span>${user.username}${user.hasUserKeys ? ' ✅' : ''}</span>
+                            <button onclick="downloadUserKeys('${vm.name}', '${user.username}')">Descargar llaves de usuario</button>
+                        </div>
+                    `).join('')
+                    : '<p style="color:#999">No hay usuarios creados.</p>';
                 
                 card.innerHTML = `
                     <h3>${vm.name}</h3>
@@ -240,14 +250,16 @@
                     <p>VM origen: ${vm.sourceVM}</p>
                     <p>Estado: ${vm.state || 'desconocido'}</p>
                     <p>IP: ${vm.ip || 'N/A'}</p>
-                    <p>Usuario: ${vm.username || 'N/A'} ${vm.hasUserKeys ? '✅' : ''}</p>
+                    <div>
+                        <p style="margin-bottom:8px;">Usuarios:</p>
+                        ${usersHtml}
+                    </div>
                     ${vm.diskUUID ? `<p><small>Disco UUID: ${vm.diskUUID}</small></p>` : ''}
                     <div class="form-inline">
                         <input type="text" id="username-${vm.name}" placeholder="Nombre de usuario" value="${savedValues[`username-${vm.name}`] || ''}">
                         <input type="password" id="userpassword-${vm.name}" placeholder="Contraseña" value="${savedValues[`password-${vm.name}`] || ''}">
                         <button id="btn-createuser-${vm.name}" onclick="createUser('${vm.name}')">Crear usuario</button>
                     </div>
-                    <button onclick="downloadUserKeys('${vm.name}')" ${downloadUserDisabled}>Descargar llaves de usuario</button>
                     <button id="btn-deleteuservm-${vm.name}" onclick="deleteUserVM('${vm.name}')" class="danger">Eliminar VM</button>
                 `;
                 container.appendChild(card);
@@ -395,9 +407,9 @@
             }
         }
 
-        function downloadUserKeys(vmName) {
-            toast(`Descargando llaves de usuario de "${vmName}"...`, 'info');
-            globalThis.location.href = `/api/uservms/${vmName}/keys/download`;
+        function downloadUserKeys(vmName, username) {
+            toast(`Descargando llaves de usuario de "${username}" en "${vmName}"...`, 'info');
+            globalThis.location.href = `/api/uservms/${vmName}/keys/download?username=${encodeURIComponent(username)}`;
         }
 
         async function deleteUserVM(vmName) {
