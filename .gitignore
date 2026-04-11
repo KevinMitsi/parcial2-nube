@@ -6,3 +6,4 @@ keys/
 # Nuevas reglas para archivos pesados
 disks/
 *.vdi
+*.txt
